@@ -3,7 +3,7 @@ A maubot plugin for room specific webhooks configurable from any room
 
 There are already maubot webhook plugins, but I could mainly find versions that predominantly think that the maubot admin is the only user of the webhooks (with auth and all defined here, and no !help dialogue with the clients). But I wanted to have a webhook bot that my server's users can set up themselves, with authentication and all per room with just talking to the webhook bot. So that is what I have tried to do here!
 
-Code is merely more than a hackjob, but it seems to work (but all functions are not battle tested yet, e.g. the jinja templating i have yet to fully try out)
+Code is not beatiful, but it seems to work (but all functions are not battle tested yet, e.g. the jinja templating i have yet to fully try out)
 
 So this bot will allow you to;
 - Invite the bot
