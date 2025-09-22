@@ -13,6 +13,8 @@ So this bot will allow you to;
 You can define in your config;
 - Only allow users from your homeserver to use this bot
 - PL needed to use bot
-- PLus a bit more
+- PLus a bit more; this is not fully polished
 
 Works in v12 rooms since Maubot works in v12 rooms..
+
+Feel free to contact me https://matrix.to/#/@palchrb:vibb.me  
