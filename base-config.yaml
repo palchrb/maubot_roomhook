@@ -1,0 +1,14 @@
+message_format: "markdown"   # "markdown" | "html" | "plaintext"
+message_type: "m.notice"     # "m.text" | "m.notice"
+
+restrict_admin_to_local: true
+restrict_commands_to_local: true
+local_homeserver_domain: "example.com"
+pl_required: 50
+adminlist: []
+
+rate_limit_per_minute: 0
+max_body_bytes: 0
+allowed_methods: ["POST"]
+enable_path_token_route: true
+allow_query_token: true
