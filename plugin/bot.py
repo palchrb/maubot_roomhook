@@ -118,14 +118,19 @@ class RoomWebhooksPlugin(Plugin):
         return have == want
 
     async def _get_user_pl(self, room_id: RoomID, user: UserID) -> int:
-        """Return user's PL. Works whether get_state_event returns dict, StateEvent, or PowerLevelStateEventContent."""
+        """Return user's effective PL. Handles v12 owner and power_levels."""
+        # 1) v12 owner/creator yields "infinite" PL
+        owner_pl = await self._owner_pl_if_v12(room_id, user)
+        if owner_pl is not None:
+            return owner_pl
+
+        # 2) Normal power_levels fetch (robust across return types)
         try:
             ev = await self.client.get_state_event(room_id, EventType.ROOM_POWER_LEVELS)
         except Exception as e:
             self.log.warning(f"PL fetch failed in {room_id} for {user}: {e}")
             return 0
 
-    # Normalize to PowerLevelStateEventContent -> pls
         try:
             if isinstance(ev, PowerLevelStateEventContent):
                 pls = ev
@@ -138,16 +143,13 @@ class RoomWebhooksPlugin(Plugin):
                 elif isinstance(c, dict):
                     pls = PowerLevelStateEventContent.deserialize(c)
                 else:
-                # last resort: try to deserialize whatever this is
                     pls = PowerLevelStateEventContent.deserialize(getattr(c, "__dict__", {}))
             else:
-                # final fallback: assume ev is dict-like
                 pls = PowerLevelStateEventContent.deserialize(getattr(ev, "__dict__", {}))
         except Exception as e:
             self.log.warning(f"PL parse failed in {room_id} for {user}: {e}")
             return 0
 
-    # Keys in pls.users kan være UserID eller str – prøv begge
         level = pls.users.get(user)
         if level is None:
             level = pls.users.get(str(user))
@@ -158,8 +160,6 @@ class RoomWebhooksPlugin(Plugin):
         except Exception:
             return 0
 
-
-
     async def _has_required_pl(self, room_id: RoomID, user: UserID) -> bool:
         required = int(self.config["pl_required"] or 0)
         if required <= 0:
@@ -169,13 +169,80 @@ class RoomWebhooksPlugin(Plugin):
 
     async def _require_local_cmd(self, evt: MessageEvent) -> bool:
         """Gate all !webhook commands to local users if configured."""
-        # NB: RecursiveDict.get(key, default) – må ha default-argument
+        # NOTE: RecursiveDict.get(key, default) — must include a default argument
         restrict = bool(self.config.get("restrict_commands_to_local", False))
         if restrict and not self._is_local(evt.sender):
             await evt.reply("Only local users are allowed to use webhook commands.")
             return False
         return True
 
+    async def _owner_pl_if_v12(self, room_id: RoomID, user: UserID) -> Optional[int]:
+        """Return a very high PL if user is a v12 creator (sender of m.room.create) or in additional_creators."""
+        # 1) Fetch m.room.create (may be a full event, or only a content object without sender)
+        ev = None
+        try:
+            ev = await self.client.get_state_event(room_id, EventType.ROOM_CREATE)
+        except Exception:
+            pass
+
+        content: Dict[str, Any] = {}
+        sender = ""
+
+        if isinstance(ev, dict):
+            # Full raw event
+            sender = str(ev.get("sender", "") or "")
+            c = ev.get("content")
+            if isinstance(c, dict):
+                content = c
+        elif ev is not None:
+            # Often RoomCreateStateEventContent without sender
+            try:
+                if hasattr(ev, "serialize"):
+                    content = ev.serialize()  # type: ignore[attr-defined]
+                else:
+                    content = getattr(ev, "__dict__", {}) or {}
+            except Exception:
+                content = getattr(ev, "__dict__", {}) or {}
+
+        # 2) Read room_version
+        rv = (content or {}).get("room_version")
+        try:
+            rv_int = int(str(rv))
+        except Exception:
+            rv_int = None
+
+        # 3) If v12+ and missing sender → fetch via raw /state
+        if rv_int is not None and rv_int >= 12 and not sender:
+            try:
+                from urllib.parse import quote
+                path = f"/_matrix/client/v3/rooms/{quote(str(room_id))}/state"
+                raw_state = await self.client.api.request("GET", path)
+                if isinstance(raw_state, list):
+                    for e in raw_state:
+                        if not isinstance(e, dict):
+                            continue
+                        if e.get("type") == "m.room.create" and (e.get("state_key", "") == ""):
+                            sender = str(e.get("sender", "") or "")
+                            c = e.get("content")
+                            if not content and isinstance(c, dict):
+                                content = c
+                            break
+            except Exception as ex:
+                self.log.debug(f"v12 owner sender fetch via /state failed in {room_id}: {ex}")
+
+        # 4) v12 rule: sender of create or in additional_creators => effectively unlimited PL
+        if rv_int is not None and rv_int >= 12:
+            addl = (content or {}).get("additional_creators") or []
+            if sender and (sender == str(user) or (isinstance(addl, list) and str(user) in addl)):
+                return 1_000_000  # effectively unlimited
+            return None
+
+        # 5) Older rooms: 'creator' in content typically yields high PL (e.g. 100)
+        creator = (content or {}).get("creator")
+        if creator and creator == str(user):
+            return 100
+
+        return None
 
     async def _check_admin(self, evt: MessageEvent) -> bool:
         # First, ensure command locality if required
@@ -465,6 +532,36 @@ class RoomWebhooksPlugin(Plugin):
             f"- Path:   `POST {url_path}`"
         )
 
+    @webhook.subcommand(name="delete", help="Permanently delete a hook: !webhook delete <name>")
+    @command.argument("name", required=False)
+    async def webhook_delete(self, evt: MessageEvent, name: Optional[str] = None) -> None:
+        if not await self._check_admin(evt):
+            return
+        if not name:
+            await evt.reply("Usage: `!webhook delete <name>`")
+            return
+
+        rid = str(evt.room_id)
+        row = await self.database.fetchrow(
+            "SELECT 1 FROM room_hooks WHERE room_id=$1 AND name=$2",
+            rid, name
+        )
+        if not row:
+            await evt.reply("No such hook.")
+            return
+
+        # (Optional) neutralize token before delete for backups/replica hygiene:
+        # await self.database.execute(
+        #     "UPDATE room_hooks SET token_hash=$1 WHERE room_id=$2 AND name=$3",
+        #     sha256_hex(secrets.token_urlsafe(32)), rid, name
+        # )
+
+        await self.database.execute(
+            "DELETE FROM room_hooks WHERE room_id=$1 AND name=$2",
+            rid, name
+        )
+        await evt.reply(f"🗑️ Deleted hook **{name}**.")
+
     @webhook.subcommand(name="set", help="Set per-hook format/type/raw: !webhook set <name> <fmt|type|raw> <value>")
     @command.argument("args", pass_raw=True, required=False)
     async def webhook_set(self, evt: MessageEvent, args: Optional[str] = None) -> None:
@@ -488,23 +585,23 @@ class RoomWebhooksPlugin(Plugin):
             await evt.reply("No active hook.")
             return
 
-        if key in ("fmt","format"):
-            if value not in ("markdown","html","plaintext"):
+        if key in ("fmt", "format"):
+            if value not in ("markdown", "html", "plaintext"):
                 await evt.reply("Invalid fmt: use `markdown|html|plaintext`"); return
             await self.database.execute(
                 "UPDATE room_hooks SET fmt=$1 WHERE room_id=$2 AND name=$3", value, rid, name
             )
         elif key == "type":
-            if value not in ("m.text","m.notice"):
+            if value not in ("m.text", "m.notice"):
                 await evt.reply("Invalid type: use `m.text|m.notice`"); return
             await self.database.execute(
                 "UPDATE room_hooks SET msgtype=$1 WHERE room_id=$2 AND name=$3", value, rid, name
             )
         elif key == "raw":
             v = value.lower()
-            if v not in ("on","off","true","false","1","0"):
+            if v not in ("on", "off", "true", "false", "1", "0"):
                 await evt.reply("Invalid raw: use `on|off`"); return
-            flag = v in ("on","true","1")
+            flag = v in ("on", "true", "1")
             await self.database.execute(
                 "UPDATE room_hooks SET raw=$1 WHERE room_id=$2 AND name=$3", flag, rid, name
             )
