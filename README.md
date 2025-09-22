@@ -17,4 +17,4 @@ You can define in your config;
 
 Works in v12 rooms since Maubot works in v12 rooms..
 
-Feel free to contact me https://matrix.to/#/@palchrb:vibb.me  
+Feel free to contact me [on Matrix](https://matrix.to/#/@palchrb:vibb.me)
