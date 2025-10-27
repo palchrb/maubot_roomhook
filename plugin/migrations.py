@@ -50,3 +50,19 @@ async def upgrade_v3(conn: Connection, scheme: Scheme) -> None:
         await conn.execute("ALTER TABLE room_hooks ADD COLUMN IF NOT EXISTS raw INTEGER DEFAULT 0")
     else:
         await conn.execute("ALTER TABLE room_hooks ADD COLUMN IF NOT EXISTS raw BOOLEAN DEFAULT FALSE")
+
+@upgrade_table.register(description="Add per-hook profile fields and profile_mode")
+async def upgrade_v4(conn: Connection, scheme: Scheme) -> None:
+    # Profile fields: label, displayname, avatar_url
+    await conn.execute("ALTER TABLE room_hooks ADD COLUMN IF NOT EXISTS label TEXT")
+    await conn.execute("ALTER TABLE room_hooks ADD COLUMN IF NOT EXISTS displayname TEXT")
+    await conn.execute("ALTER TABLE room_hooks ADD COLUMN IF NOT EXISTS avatar_url TEXT")
+    # Profile mode: 'static' (default) or 'email_from'
+    await conn.execute("ALTER TABLE room_hooks ADD COLUMN IF NOT EXISTS profile_mode TEXT DEFAULT 'static'")
+
+@upgrade_table.register(description="Add profile_prefix_fallback toggle")
+async def upgrade_v5(conn: Connection, scheme: Scheme) -> None:
+    if scheme == Scheme.SQLITE:
+        await conn.execute("ALTER TABLE room_hooks ADD COLUMN IF NOT EXISTS profile_prefix_fallback INTEGER DEFAULT 1")
+    else:
+        await conn.execute("ALTER TABLE room_hooks ADD COLUMN IF NOT EXISTS profile_prefix_fallback BOOLEAN DEFAULT TRUE")
