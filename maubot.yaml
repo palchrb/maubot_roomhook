@@ -1,6 +1,6 @@
 maubot: 0.5.0
 id: vibb.me.roomwebhooks
-version: 0.1.6
+version: 0.2.8
 license: AGPL-3.0-or-later
 modules:
   - plugin
@@ -11,4 +11,5 @@ webapp: true
 config: true
 
 extra_files:
+
 - base-config.yaml
