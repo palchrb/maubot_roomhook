@@ -1,14 +1,15 @@
 # maubot_roomhook
-A maubot plugin for room specific webhooks configurable from any room
+A maubot plugin for room specific webhooks configurable from any room, with possibility to set per message profile (name and avatar) per webhook to give it a much cooler visual! No more loads of messages from the same bot user, for clients that have incorporated this MSC it will show whatever profile you want it to show for a specific webhook.
 
 There are already maubot webhook plugins, but I could mainly find versions that predominantly think that the maubot admin is the only user of the webhooks (with auth and all defined here, and no !help dialogue with the clients). But I wanted to have a webhook bot that my server's users can set up themselves, with authentication and all per room with just talking to the webhook bot. So that is what I have tried to do here!
 
-Code is not beatiful, but it seems to work (but all functions are not battle tested yet, e.g. the jinja templating i have yet to fully try out)
+Code is not beatiful, but it seems to work (but all functions are not battle tested yet..)
 
 So this bot will allow you to;
 - Invite the bot
 - !webhook add "name" to generate a webhook config with bearer token, specific to this room only
 - full url with tokens displayed, both with the option to use bearer token and inline url token if that is what is needed for your service
+- Define all webhooks from a mgmt room of your choosing to avoid exposing tokens to the whole room
 
 You can define in your config;
 - Only allow users from your homeserver to use this bot
