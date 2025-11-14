@@ -1308,10 +1308,22 @@ class RoomWebhooksPlugin(Plugin):
             if prefix_enabled:
                 prefix = f'<strong data-mx-profile-fallback>{html.escape(displayname)}: </strong>'
                 inner_stripped = inner.lstrip().lower()
-                if any(inner_stripped.startswith(tag) for tag in MD_BLOCK_TAGS):
+
+                # NEW: avoid wrapping markdown HTML that already starts with <p
+                if inner_stripped.startswith("<p"):
+                    # inject prefix right after the opening <p>
+                    inner = re.sub(
+                        r"(?i)^(\s*<p\s*>)",
+                        r"\1" + prefix,
+                        inner,
+                        count=1,
+                    )
+                    html_body = inner
+                elif any(inner_stripped.startswith(tag) for tag in MD_BLOCK_TAGS):
                     html_body = f"<p>{prefix}</p>{inner}"
                 else:
                     html_body = f"<p>{prefix}{inner}</p>"
+
                 plain = f"{displayname}: {str(content)}"
             else:
                 html_body = inner
@@ -1326,6 +1338,7 @@ class RoomWebhooksPlugin(Plugin):
             html_body = f"<p>{esc}</p>"
             plain = str(content)
         return plain, html_body
+
 
     def _strip_html_to_plain(self, html_in: str) -> str:
         s = re.sub(r"(?i)<\s*br\s*/?\s*>", "\n", html_in)
