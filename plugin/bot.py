@@ -81,58 +81,173 @@ def _escape_html(s: str) -> str:
     return html.escape(s, quote=False)
 
 def markdown_to_html(md: str) -> str:
+    """
+    Minimal and safe Markdown → HTML converter.
+    Supported:
+      - Headings: # .. ######  → <h1> .. <h6>
+      - Fenced code blocks: ```lang?\n...\n``` → <pre><code>...</code></pre>
+      - Inline code: `code` → <code>code</code>
+      - Emphasis: **bold**, *italic*, ~~strike~~
+      - Links: [label](url) (http/https/mailto only)
+      - Autolink bare URLs: https://example.com → <a href="...">...</a>
+      - Lists: unordered (-, *) and ordered (1.)
+      - Blockquotes: lines starting with ">"
+      - Horizontal rules: lines of --- or *** or ___
+      - Paragraphs: double newlines split paragraphs, single newline → <br>
+    Notes:
+      - HTML is escaped first to avoid injection; only specific tags are emitted.
+      - This is intentionally minimal; it does not support tables, nested lists, or advanced Markdown extensions.
+    """
     if md is None:
         return ""
     text = str(md).replace("\r\n", "\n")
+
+    # 1) Escape all HTML up front
     text = _escape_html(text)
 
+    # 2) Fenced code blocks: ```lang?\n...\n```
     def _codeblock_repl(m):
+        # group(1) is optional language (ignored), group(2) is the code (already escaped)
         code = m.group(2)
         return f"<pre><code>{code}</code></pre>"
+
     text = re.sub(r"```([^\n`]*)\n([\s\S]*?)```", _codeblock_repl, text, flags=re.MULTILINE)
 
+    # 3) Inline code: `code` (not inside fenced blocks anymore)
     text = re.sub(r"(?<!`)`([^`\n]+)`(?!`)", r"<code>\1</code>", text)
-    text = re.sub(r"\*\*([^\n*]+)\*\*", r"<strong>\1</strong>", text)
-    text = re.sub(r"\*([^\n*]+)\*", r"<em>\1</em>", text)
-    text = re.sub(r"~~([^\n~]+)~~", r"<del>\1</del>", text)
 
+    # 4) Emphasis
+    text = re.sub(r"\*\*([^\n*]+)\*\*", r"<strong>\1</strong>", text)  # bold
+    text = re.sub(r"\*([^\n*]+)\*", r"<em>\1</em>", text)              # italic
+    text = re.sub(r"~~([^\n~]+)~~", r"<del>\1</del>", text)            # strike
+
+    # 5) Links: [label](url) — allow only http/https/mailto
     def _link_repl(m):
         label = m.group(1)
         url = m.group(2)
         if not re.match(r"^(https?://|mailto:)", url, flags=re.IGNORECASE):
-            return label
+            return label  # do not link if scheme not allowed
         return f'<a href="{_escape_html(url)}" rel="noreferrer noopener">{label}</a>'
+
     text = re.sub(r"\[([^\]]+)\]\(([^)\s]+)\)", _link_repl, text)
 
+    # 6) Autolink bare URLs (simple heuristic, avoid double-linking)
+    #    We try not to match inside an existing tag/attribute by excluding quotes/brackets around.
+    def _autolink_repl(m):
+        url = m.group(0)
+        return f'<a href="{url}" rel="noreferrer noopener">{url}</a>'
+
+    text = re.sub(
+        r"(?<![\"'=])\bhttps?://[^\s<>()]+",
+        _autolink_repl,
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # 7) Line-wise processing for headings, lists, blockquotes, and hr
     lines = text.split("\n")
     html_lines = []
     in_ul = False
+    in_ol = False
+    in_bq = False  # blockquote
+
+    def _close_lists():
+        nonlocal in_ul, in_ol
+        if in_ul:
+            html_lines.append("</ul>")
+            in_ul = False
+        if in_ol:
+            html_lines.append("</ol>")
+            in_ol = False
+
+    def _close_blockquote():
+        nonlocal in_bq
+        if in_bq:
+            html_lines.append("</blockquote>")
+            in_bq = False
+
     for ln in lines:
-        m = re.match(r"^\s*[-*]\s+(.*)$", ln)
-        if m:
-            if not in_ul:
-                html_lines.append("<ul>")
-                in_ul = True
-            html_lines.append(f"<li>{m.group(1)}</li>")
-        else:
+        stripped = ln.strip()
+
+        # Horizontal rule
+        if re.match(r"^(\*\s*\*\s*\*|-{3,}|_{3,})\s*$", stripped):
+            _close_lists()
+            _close_blockquote()
+            html_lines.append("<hr>")
+            continue
+
+        # Headings: ^#{1..6} <space> text
+        m_h = re.match(r"^\s*(#{1,6})\s+(.+?)\s*$", ln)
+        if m_h:
+            _close_lists()
+            _close_blockquote()
+            level = len(m_h.group(1))
+            title = m_h.group(2)
+            html_lines.append(f"<h{level}>{title}</h{level}>")
+            continue
+
+        # Blockquote line: leading ">"
+        m_bq = re.match(r"^\s*>\s?(.*)$", ln)
+        if m_bq:
+            _close_lists()
+            if not in_bq:
+                html_lines.append("<blockquote>")
+                in_bq = True
+            # Keep line content as-is; paragraph handling will come later
+            html_lines.append(m_bq.group(1))
+            continue
+
+        # Ordered list: "1. item"
+        m_ol = re.match(r"^\s*\d+\.\s+(.*)$", ln)
+        if m_ol:
+            _close_blockquote()
             if in_ul:
                 html_lines.append("</ul>")
                 in_ul = False
-            html_lines.append(ln)
-    if in_ul:
-        html_lines.append("</ul>")
+            if not in_ol:
+                html_lines.append("<ol>")
+                in_ol = True
+            html_lines.append(f"<li>{m_ol.group(1)}</li>")
+            continue
+
+        # Unordered list: "- item" or "* item"
+        m_ul = re.match(r"^\s*[-*]\s+(.*)$", ln)
+        if m_ul:
+            _close_blockquote()
+            if in_ol:
+                html_lines.append("</ol>")
+                in_ol = False
+            if not in_ul:
+                html_lines.append("<ul>")
+                in_ul = True
+            html_lines.append(f"<li>{m_ul.group(1)}</li>")
+            continue
+
+        # Plain line
+        _close_lists()
+        # If we were in a blockquote and hit a non-">" line, close it before continuing
+        _close_blockquote()
+        html_lines.append(ln)
+
+    # Close any open constructs
+    _close_lists()
+    _close_blockquote()
+
     text = "\n".join(html_lines)
 
+    # 8) Paragraph splitting: wrap non-block sections in <p>, preserve single-line breaks as <br>
     parts = re.split(r"\n{2,}", text)
     out = []
     for part in parts:
         part = part.strip()
         if not part:
             continue
+        # If this chunk already starts with a block-level tag, keep as-is
         if any(part.lower().startswith(tag) for tag in MD_BLOCK_TAGS):
             out.append(part)
         else:
             out.append(f"<p>{part.replace('\n', '<br>')}</p>")
+
     return "".join(out)
 
 # ---------------- config ----------------
@@ -791,16 +906,19 @@ class RoomWebhooksPlugin(Plugin):
             await evt.reply("Usage: `!webhook tpl <name> reset|message <code> [!room|#alias]`")
             return
 
-        parts = args.split()
-        parts2, target = self._maybe_peel_target(parts)
+        # Split the input into "head" (first line) and "body" (the rest)
+        head, sep, body_rest = args.partition("\n")
+        head_parts = head.split()
+        head_parts2, target = self._maybe_peel_target(head_parts)
 
-        if len(parts2) < 2:
+        if len(head_parts2) < 2:
             await evt.reply("Usage: `!webhook tpl <name> reset|message <code> [!room|#alias]`")
             return
 
-        name, sub = parts2[0], parts2[1].lower()
-        body = " ".join(parts2[2:]) if len(parts2) >= 3 else None
+        name = head_parts2[0]
+        sub = head_parts2[1].lower()
 
+        # For 'reset', we don't need a body
         rid = await self._resolve_target_room(evt, target)
         if not rid:
             return
@@ -810,7 +928,8 @@ class RoomWebhooksPlugin(Plugin):
             "SELECT revoked FROM room_hooks WHERE room_id=$1 AND name=$2", rid_s, name
         )
         if not exists or exists["revoked"]:
-            await evt.reply("No active hook."); return
+            await evt.reply("No active hook.")
+            return
 
         if sub == "reset":
             await self.database.execute(
@@ -819,13 +938,21 @@ class RoomWebhooksPlugin(Plugin):
             await evt.reply("✅ Template cleared (using default simple message).")
             return
 
-        if sub != "message" or not body:
-            await evt.reply("Usage: `!webhook tpl <name> message <code> [!room|#alias]`"); return
+        if sub != "message":
+            await evt.reply("Usage: `!webhook tpl <name> message <code> [!room|#alias]`")
+            return
+
+        # The rest of the message (after the first line) is the template body – keep newlines!
+        body = body_rest.lstrip("\n")
+        if not body:
+            await evt.reply("Usage: `!webhook tpl <name> message <code> [!room|#alias]`")
+            return
 
         try:
             self.jinja.from_string(body)
         except Exception as e:
-            await evt.reply(f"Template error: {e}"); return
+            await evt.reply(f"Template error: {e}")
+            return
 
         await self.database.execute(
             "UPDATE room_hooks SET msg_tpl=$1 WHERE room_id=$2 AND name=$3", body, rid_s, name
@@ -993,19 +1120,40 @@ class RoomWebhooksPlugin(Plugin):
     async def _parse_body(self, req: Request) -> Dict[str, Any]:
         ctype = (req.headers.get("Content-Type") or "").lower()
         raw = await req.read()
+        text = raw.decode(errors="replace")
+
+        # If explicitly JSON, try JSON but fallback safely
         if "application/json" in ctype:
             try:
-                return json.loads(raw.decode() or "{}")
+                return json.loads(text or "{}")
             except Exception:
-                raise ValueError("invalid_json")
+                return {
+                    "message": text,
+                    "_raw": text,
+                    "_parse_error": "invalid_json_but_treated_as_text",
+                }
+
+        # Form-encoded
         if "application/x-www-form-urlencoded" in ctype:
-            return {k: v[0] for k, v in parse_qs(raw.decode()).items()}
+            return {k: v[0] for k, v in parse_qs(text).items()}
+
+        # Plain text or missing
         if "text/plain" in ctype or not ctype:
-            return {"raw": raw.decode(errors="replace")}
+            return {
+                "message": text,
+                "_raw": text,
+            }
+
+        # Unknown content-type → try JSON, fallback to raw
         try:
-            return json.loads(raw.decode() or "{}")
+            return json.loads(text or "{}")
         except Exception:
-            return {"raw": raw.decode(errors="replace")}
+            return {
+                "message": text,
+                "_raw": text,
+                "_parse_error": "unknown_content_type_fallback",
+            }
+
 
     @web.post("/send")
     async def handle_send(self, req: Request) -> Response:
