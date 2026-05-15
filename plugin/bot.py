@@ -388,7 +388,7 @@ class RoomWebhooksPlugin(Plugin):
     async def _require_local_cmd(self, evt: MessageEvent) -> bool:
         restrict = bool(self.config.get("restrict_commands_to_local", False))
         if restrict and not self._is_local(evt.sender):
-            await evt.reply("Only local users are allowed to use webhook commands.")
+            await self._reply(evt, "Only local users are allowed to use webhook commands.")
             return False
         return True
 
@@ -518,11 +518,11 @@ class RoomWebhooksPlugin(Plugin):
     # ---- convenience ----
     @command.new(name="roomid")
     async def cmd_roomid(self, evt: MessageEvent) -> None:
-        await evt.reply(f"`{evt.room_id}`")
+        await self._reply(evt, f"`{evt.room_id}`")
 
     @command.new(name="url")
     async def cmd_url(self, evt: MessageEvent) -> None:
-        await evt.reply(f"`{self.webapp_url}send` and `{self.webapp_url}hook/<token>`")
+        await self._reply(evt, f"`{self.webapp_url}send` and `{self.webapp_url}hook/<token>`")
 
     # ---- commands ----
     @command.new(name="webhook", require_subcommand=True, help="Manage webhooks in this room")
@@ -559,7 +559,7 @@ class RoomWebhooksPlugin(Plugin):
         read_ok = bot_in_target and you_in_target
         mutate_ok = bot_in_target and (in_adminlist or (local_ok and pl_target >= required))
 
-        await self.client.send_markdown(
+        await self._notice(
             evt.room_id,
             "**Webhook permission diagnostics**\n"
             f"- You: `{evt.sender}` (server: `{self._user_domain(evt.sender)}`)\n"
@@ -572,7 +572,8 @@ class RoomWebhooksPlugin(Plugin):
             f"- Your PL in mgmt room: **{pl_here}** (informational)\n"
             f"- Your PL in target: **{pl_target}**\n"
             f"- Read access (target): **{'ALLOWED' if read_ok else 'DENIED'}**\n"
-            f"- Mutate access (target): **{'ALLOWED' if mutate_ok else 'DENIED'}**"
+            f"- Mutate access (target): **{'ALLOWED' if mutate_ok else 'DENIED'}**",
+            markdown=True,
         )
 
     @webhook.subcommand(name="help", help="Show help")
@@ -600,7 +601,7 @@ class RoomWebhooksPlugin(Plugin):
             "- Or: `POST /hook/<token>` (path token)\n"
             "- Optional per-request profile override: `\"_profile\": {\"id\":\"…\",\"displayname\":\"…\",\"avatar_url\":\"mxc://…\"}`\n"
         )
-        await self.client.send_markdown(evt.room_id, text)
+        await self._notice(evt.room_id, text, markdown=True)
 
     # ---- list ----
     @webhook.subcommand(name="list", help="List hooks in this room or a target room")
@@ -617,10 +618,10 @@ class RoomWebhooksPlugin(Plugin):
             "SELECT name, revoked FROM room_hooks WHERE room_id=$1 ORDER BY name", str(rid)
         )
         if not rows:
-            await evt.reply("No hooks here yet. Use `!webhook add <name>`.")
+            await self._reply(evt, "No hooks here yet. Use `!webhook add <name>`.")
         else:
             lines = [f"- **{r['name']}** — {'revoked' if r['revoked'] else 'active'}" for r in rows]
-            await self.client.send_markdown(evt.room_id, "\n".join(lines))
+            await self._notice(evt.room_id, "\n".join(lines), markdown=True)
 
     # ---- add ----
     @webhook.subcommand(name="add", help="Create a new hook: !webhook add <name> [!room|#alias]")
@@ -628,11 +629,11 @@ class RoomWebhooksPlugin(Plugin):
     async def webhook_add(self, evt: MessageEvent, args: str) -> None:
         parts = args.split()
         if not parts:
-            await evt.reply("Usage: `!webhook add <name> [!room|#alias]`")
+            await self._reply(evt, "Usage: `!webhook add <name> [!room|#alias]`")
             return
         parts2, target = self._maybe_peel_target(parts)
         if not parts2:
-            await evt.reply("Usage: `!webhook add <name> [!room|#alias]`")
+            await self._reply(evt, "Usage: `!webhook add <name> [!room|#alias]`")
             return
         name = parts2[0]
         rid = await self._resolve_target_room(evt, target)
@@ -649,7 +650,7 @@ class RoomWebhooksPlugin(Plugin):
             "SELECT revoked FROM room_hooks WHERE room_id=$1 AND name=$2", rid_s, name
         )
         if row and not row["revoked"]:
-            await evt.reply("Hook already exists. Use `!webhook rotate <name>` or `!webhook show <name>`.")
+            await self._reply(evt, "Hook already exists. Use `!webhook rotate <name>` or `!webhook show <name>`.")
             return
 
         if row:
@@ -684,7 +685,7 @@ class RoomWebhooksPlugin(Plugin):
             f"**Token is shown only now:** `{tok}`\n"
             f"_Run `!webhook save {name}` to store and **redact** this message._"
         )
-        ev_id = await self.client.send_markdown(evt.room_id, text)
+        ev_id = await self._notice(evt.room_id, text, markdown=True)
 
         await self.database.execute("""
             UPDATE room_hooks SET last_token_event_id=$1 WHERE room_id=$2 AND name=$3
@@ -696,7 +697,7 @@ class RoomWebhooksPlugin(Plugin):
     async def webhook_save(self, evt: MessageEvent, args: str) -> None:
         parts = args.split()
         if not parts:
-            await evt.reply("Usage: `!webhook save <name> [!room|#alias]`")
+            await self._reply(evt, "Usage: `!webhook save <name> [!room|#alias]`")
             return
         parts2, target = self._maybe_peel_target(parts)
         name = parts2[0]
@@ -711,7 +712,7 @@ class RoomWebhooksPlugin(Plugin):
             SELECT last_token_event_id FROM room_hooks WHERE room_id=$1 AND name=$2
         """, rid_s, name)
         if not row or not row["last_token_event_id"]:
-            await evt.reply("No token message found to redact.")
+            await self._reply(evt, "No token message found to redact.")
             return
         ev_id = row["last_token_event_id"]
         await self.database.execute("""
@@ -719,10 +720,10 @@ class RoomWebhooksPlugin(Plugin):
         """, rid_s, name)
         try:
             await self.client.redact(rid, ev_id, reason="Hide token")
-            await evt.reply("✅ Stored. The token message has been redacted.")
+            await self._reply(evt, "✅ Stored. The token message has been redacted.")
         except Exception as e:
             self.log.exception("Redact failed")
-            await evt.reply(f"Token stored, but redaction failed: {e}")
+            await self._reply(evt, f"Token stored, but redaction failed: {e}")
 
     # ---- rotate ----
     @webhook.subcommand(name="rotate", help="Rotate token")
@@ -730,7 +731,7 @@ class RoomWebhooksPlugin(Plugin):
     async def webhook_rotate(self, evt: MessageEvent, args: str) -> None:
         parts = args.split()
         if not parts:
-            await evt.reply("Usage: `!webhook rotate <name> [!room|#alias]`")
+            await self._reply(evt, "Usage: `!webhook rotate <name> [!room|#alias]`")
             return
         parts2, target = self._maybe_peel_target(parts)
         name = parts2[0]
@@ -747,7 +748,7 @@ class RoomWebhooksPlugin(Plugin):
             SELECT revoked FROM room_hooks WHERE room_id=$1 AND name=$2
         """, rid_s, name)
         if not row or row["revoked"]:
-            await evt.reply("No active hook. Run `!webhook add <name>` first.")
+            await self._reply(evt, "No active hook. Run `!webhook add <name>` first.")
             return
         await self.database.execute("""
             UPDATE room_hooks
@@ -757,13 +758,14 @@ class RoomWebhooksPlugin(Plugin):
 
         url_send = f"{self.webapp_url}send"
         url_path = f"{self.webapp_url}hook/{tok}"
-        ev_id = await self.client.send_markdown(
+        ev_id = await self._notice(
             evt.room_id,
             f"🔁 New token for **{name}**\n\n"
             f"Bearer: `POST {url_send}` (Authorization: Bearer {tok})\n"
             f"Path:   `POST {url_path}`\n\n"
             f"**Token is shown only now:** `{tok}`\n"
-            f"Run `!webhook save {name}` to redact."
+            f"Run `!webhook save {name}` to redact.",
+            markdown=True,
         )
         await self.database.execute("""
             UPDATE room_hooks SET last_token_event_id=$1 WHERE room_id=$2 AND name=$3
@@ -775,7 +777,7 @@ class RoomWebhooksPlugin(Plugin):
     async def webhook_revoke(self, evt: MessageEvent, args: str) -> None:
         parts = args.split()
         if not parts:
-            await evt.reply("Usage: `!webhook revoke <name> [!room|#alias]`")
+            await self._reply(evt, "Usage: `!webhook revoke <name> [!room|#alias]`")
             return
         parts2, target = self._maybe_peel_target(parts)
         name = parts2[0]
@@ -790,15 +792,15 @@ class RoomWebhooksPlugin(Plugin):
             SELECT revoked FROM room_hooks WHERE room_id=$1 AND name=$2
         """, rid_s, name)
         if not row:
-            await evt.reply("No such hook.")
+            await self._reply(evt, "No such hook.")
             return
         if row["revoked"]:
-            await evt.reply("Hook is already disabled.")
+            await self._reply(evt, "Hook is already disabled.")
             return
         await self.database.execute("""
             UPDATE room_hooks SET revoked=TRUE WHERE room_id=$1 AND name=$2
         """, rid_s, name)
-        await evt.reply(f"🚫 Hook **{name}** disabled.")
+        await self._reply(evt, f"🚫 Hook **{name}** disabled.")
 
     # ---- show ----
     @webhook.subcommand(name="show", help="Show endpoints")
@@ -808,7 +810,7 @@ class RoomWebhooksPlugin(Plugin):
             return
         parts = args.split()
         if not parts:
-            await evt.reply("Usage: `!webhook show <name> [!room|#alias]`")
+            await self._reply(evt, "Usage: `!webhook show <name> [!room|#alias]`")
             return
         parts2, target = self._maybe_peel_target(parts)
         name = parts2[0]
@@ -821,15 +823,16 @@ class RoomWebhooksPlugin(Plugin):
             SELECT revoked FROM room_hooks WHERE room_id=$1 AND name=$2
         """, rid_s, name)
         if not row or row["revoked"]:
-            await evt.reply("No active hook.")
+            await self._reply(evt, "No active hook.")
             return
         url_send = f"{self.webapp_url}send"
         url_path = f"{self.webapp_url}hook/<token>"
-        await self.client.send_markdown(
+        await self._notice(
             evt.room_id,
             f"**{name}**\n"
             f"- Bearer: `POST {url_send}` with `Authorization: Bearer <token>`\n"
-            f"- Path:   `POST {url_path}`"
+            f"- Path:   `POST {url_path}`",
+            markdown=True,
         )
 
     # ---- delete ----
@@ -838,7 +841,7 @@ class RoomWebhooksPlugin(Plugin):
     async def webhook_delete(self, evt: MessageEvent, args: str) -> None:
         parts = args.split()
         if not parts:
-            await evt.reply("Usage: `!webhook delete <name> [!room|#alias]`")
+            await self._reply(evt, "Usage: `!webhook delete <name> [!room|#alias]`")
             return
         parts2, target = self._maybe_peel_target(parts)
         name = parts2[0]
@@ -854,27 +857,27 @@ class RoomWebhooksPlugin(Plugin):
             rid_s, name
         )
         if not row:
-            await evt.reply("No such hook.")
+            await self._reply(evt, "No such hook.")
             return
 
         await self.database.execute(
             "DELETE FROM room_hooks WHERE room_id=$1 AND name=$2",
             rid_s, name
         )
-        await evt.reply(f"🗑️ Deleted hook **{name}**.")
+        await self._reply(evt, f"🗑️ Deleted hook **{name}**.")
 
     # ---- set (fmt/type/raw) ----
     @webhook.subcommand(name="set", help="Set per-hook format/type/raw: !webhook set <name> <fmt|type|raw> <value> [!room|#alias]")
     @command.argument("args", pass_raw=True, required=False)
     async def webhook_set(self, evt: MessageEvent, args: Optional[str] = None) -> None:
         if not args:
-            await evt.reply("Usage: `!webhook set <name> <fmt|type|raw> <value> [!room|#alias]`")
+            await self._reply(evt, "Usage: `!webhook set <name> <fmt|type|raw> <value> [!room|#alias]`")
             return
 
         parts = args.split()
         parts2, target = self._maybe_peel_target(parts)
         if len(parts2) < 3:
-            await evt.reply("Usage: `!webhook set <name> <fmt|type|raw> <value> [!room|#alias]`")
+            await self._reply(evt, "Usage: `!webhook set <name> <fmt|type|raw> <value> [!room|#alias]`")
             return
 
         name, key, value = parts2[0], parts2[1].lower(), " ".join(parts2[2:])
@@ -889,39 +892,39 @@ class RoomWebhooksPlugin(Plugin):
             "SELECT revoked FROM room_hooks WHERE room_id=$1 AND name=$2", rid_s, name
         )
         if not exists or exists["revoked"]:
-            await evt.reply("No active hook.")
+            await self._reply(evt, "No active hook.")
             return
 
         if key in ("fmt", "format"):
             if value not in ("markdown", "html", "plaintext"):
-                await evt.reply("Invalid fmt: use `markdown|html|plaintext`"); return
+                await self._reply(evt, "Invalid fmt: use `markdown|html|plaintext`"); return
             await self.database.execute(
                 "UPDATE room_hooks SET fmt=$1 WHERE room_id=$2 AND name=$3", value, rid_s, name
             )
         elif key == "type":
             if value not in ("m.text", "m.notice"):
-                await evt.reply("Invalid type: use `m.text|m.notice`"); return
+                await self._reply(evt, "Invalid type: use `m.text|m.notice`"); return
             await self.database.execute(
                 "UPDATE room_hooks SET msgtype=$1 WHERE room_id=$2 AND name=$3", value, rid_s, name
             )
         elif key == "raw":
             v = value.lower()
             if v not in ("on", "off", "true", "false", "1", "0"):
-                await evt.reply("Invalid raw: use `on|off`"); return
+                await self._reply(evt, "Invalid raw: use `on|off`"); return
             flag = v in ("on", "true", "1")
             await self.database.execute(
                 "UPDATE room_hooks SET raw=$1 WHERE room_id=$2 AND name=$3", flag, rid_s, name
             )
         else:
-            await evt.reply("Unknown setting. Use `fmt|type|raw`"); return
-        await evt.reply("✅ Updated.")
+            await self._reply(evt, "Unknown setting. Use `fmt|type|raw`"); return
+        await self._reply(evt, "✅ Updated.")
 
     # ---- template ----
     @webhook.subcommand(name="tpl", help="Template: !webhook tpl <name> reset|message <code> [!room|#alias]")
     @command.argument("args", pass_raw=True, required=False)
     async def webhook_tpl(self, evt: MessageEvent, args: Optional[str] = None) -> None:
         if not args:
-            await evt.reply("Usage: `!webhook tpl <name> reset|message <code> [!room|#alias]`")
+            await self._reply(evt, "Usage: `!webhook tpl <name> reset|message <code> [!room|#alias]`")
             return
 
         # Split the input into "head" (first line) and "body" (the rest)
@@ -930,7 +933,7 @@ class RoomWebhooksPlugin(Plugin):
         head_parts2, target = self._maybe_peel_target(head_parts)
 
         if len(head_parts2) < 2:
-            await evt.reply("Usage: `!webhook tpl <name> reset|message <code> [!room|#alias]`")
+            await self._reply(evt, "Usage: `!webhook tpl <name> reset|message <code> [!room|#alias]`")
             return
 
         name = head_parts2[0]
@@ -948,36 +951,36 @@ class RoomWebhooksPlugin(Plugin):
             "SELECT revoked FROM room_hooks WHERE room_id=$1 AND name=$2", rid_s, name
         )
         if not exists or exists["revoked"]:
-            await evt.reply("No active hook.")
+            await self._reply(evt, "No active hook.")
             return
 
         if sub == "reset":
             await self.database.execute(
                 "UPDATE room_hooks SET msg_tpl=NULL WHERE room_id=$1 AND name=$2", rid_s, name
             )
-            await evt.reply("✅ Template cleared (using default simple message).")
+            await self._reply(evt, "✅ Template cleared (using default simple message).")
             return
 
         if sub != "message":
-            await evt.reply("Usage: `!webhook tpl <name> message <code> [!room|#alias]`")
+            await self._reply(evt, "Usage: `!webhook tpl <name> message <code> [!room|#alias]`")
             return
 
         # The rest of the message (after the first line) is the template body – keep newlines!
         body = body_rest.lstrip("\n")
         if not body:
-            await evt.reply("Usage: `!webhook tpl <name> message <code> [!room|#alias]`")
+            await self._reply(evt, "Usage: `!webhook tpl <name> message <code> [!room|#alias]`")
             return
 
         try:
             self.jinja.from_string(body)
         except Exception as e:
-            await evt.reply(f"Template error: {e}")
+            await self._reply(evt, f"Template error: {e}")
             return
 
         await self.database.execute(
             "UPDATE room_hooks SET msg_tpl=$1 WHERE room_id=$2 AND name=$3", body, rid_s, name
         )
-        await evt.reply("✅ Template saved.")
+        await self._reply(evt, "✅ Template saved.")
 
     # ---- profile commands (per hook) ----
 
@@ -985,7 +988,7 @@ class RoomWebhooksPlugin(Plugin):
     async def webhook_profile_root(self, evt: MessageEvent) -> None:
         if not await self._require_local_cmd(evt):
             return
-        await evt.reply(
+        await self._reply(evt, 
             "Usage:\n"
             "`!webhook profile show <name> [!room|#alias]`\n"
             "`!webhook profile set <name> <displayname> [mxc://…] [!room|#alias]`\n"
@@ -1002,7 +1005,7 @@ class RoomWebhooksPlugin(Plugin):
         parts = args.split()
         parts2, target = self._maybe_peel_target(parts)
         if not parts2:
-            await evt.reply("Usage: `!webhook profile show <name> [!room|#alias]`")
+            await self._reply(evt, "Usage: `!webhook profile show <name> [!room|#alias]`")
             return
         name = parts2[0]
         rid = await self._resolve_target_room(evt, target)
@@ -1016,16 +1019,17 @@ class RoomWebhooksPlugin(Plugin):
              WHERE room_id=$1 AND name=$2
         """, rid_s, name)
         if not row:
-            await evt.reply("No such hook.")
+            await self._reply(evt, "No such hook.")
             return
-        await self.client.send_markdown(
+        await self._notice(
             evt.room_id,
             "**Profile**\n"
             f"- label: `{row['label'] or ''}`\n"
             f"- displayname: `{row['displayname'] or ''}`\n"
             f"- avatar mxc: `{(row['avatar_url'] or '') or '(none)'}`\n"
             f"- profile_mode: `{row['profile_mode'] or 'static'}`\n"
-            f"- prefix_fallback: **{'on' if row['prefix_fb'] else 'off'}**"
+            f"- prefix_fallback: **{'on' if row['prefix_fb'] else 'off'}**",
+            markdown=True,
         )
 
     @webhook_profile_root.subcommand(name="set", help="Set displayname and optional avatar")
@@ -1034,7 +1038,7 @@ class RoomWebhooksPlugin(Plugin):
         parts = args.split()
         parts2, target = self._maybe_peel_target(parts)
         if len(parts2) < 2:
-            await evt.reply("Usage: `!webhook profile set <name> <displayname> [mxc://…] [!room|#alias]`")
+            await self._reply(evt, "Usage: `!webhook profile set <name> <displayname> [mxc://…] [!room|#alias]`")
             return
         name = parts2[0]
         displayname = parts2[1]
@@ -1047,7 +1051,7 @@ class RoomWebhooksPlugin(Plugin):
         rid_s = str(rid)
 
         if avatar_mxc and not avatar_mxc.startswith("mxc://"):
-            await evt.reply("avatar must start with mxc:// or be omitted.")
+            await self._reply(evt, "avatar must start with mxc:// or be omitted.")
             return
         displayname = trim_utf8_bytes(displayname, 255)
         await self.database.execute("""
@@ -1055,7 +1059,7 @@ class RoomWebhooksPlugin(Plugin):
                SET displayname=$1, avatar_url=$2
              WHERE room_id=$3 AND name=$4
         """, displayname, (avatar_mxc or ""), rid_s, name)
-        await evt.reply(f"✅ Profile updated: **{displayname}** {(avatar_mxc or '').strip()}")
+        await self._reply(evt, f"✅ Profile updated: **{displayname}** {(avatar_mxc or '').strip()}")
 
     @webhook_profile_root.subcommand(name="reset", help="Reset profile to label/no avatar")
     @command.argument("args", required=True, pass_raw=True)
@@ -1063,7 +1067,7 @@ class RoomWebhooksPlugin(Plugin):
         parts = args.split()
         parts2, target = self._maybe_peel_target(parts)
         if not parts2:
-            await evt.reply("Usage: `!webhook profile reset <name> [!room|#alias]`")
+            await self._reply(evt, "Usage: `!webhook profile reset <name> [!room|#alias]`")
             return
         name = parts2[0]
         rid = await self._resolve_target_room(evt, target)
@@ -1077,14 +1081,14 @@ class RoomWebhooksPlugin(Plugin):
             SELECT label FROM room_hooks WHERE room_id=$1 AND name=$2
         """, rid_s, name)
         if not row:
-            await evt.reply("No such hook.")
+            await self._reply(evt, "No such hook.")
             return
         await self.database.execute("""
             UPDATE room_hooks
                SET displayname=$1, avatar_url=''
              WHERE room_id=$2 AND name=$3
         """, row["label"], rid_s, name)
-        await evt.reply(f"♻️ Profile reset to default ({row['label']})")
+        await self._reply(evt, f"♻️ Profile reset to default ({row['label']})")
 
     @webhook_profile_root.subcommand(name="mode", help="Set profile mode")
     @command.argument("args", required=True, pass_raw=True)
@@ -1092,11 +1096,11 @@ class RoomWebhooksPlugin(Plugin):
         parts = args.split()
         parts2, target = self._maybe_peel_target(parts)
         if len(parts2) < 2:
-            await evt.reply("Usage: `!webhook profile mode <name> <static|email_from> [!room|#alias]`")
+            await self._reply(evt, "Usage: `!webhook profile mode <name> <static|email_from> [!room|#alias]`")
             return
         name, v = parts2[0], parts2[1].lower()
         if v not in ("static", "email_from"):
-            await evt.reply("Invalid mode: use `static|email_from`"); return
+            await self._reply(evt, "Invalid mode: use `static|email_from`"); return
         rid = await self._resolve_target_room(evt, target)
         if not rid:
             return
@@ -1108,7 +1112,7 @@ class RoomWebhooksPlugin(Plugin):
             "UPDATE room_hooks SET profile_mode=$1 WHERE room_id=$2 AND name=$3",
             v, rid_s, name
         )
-        await evt.reply(f"✅ profile_mode set to **{v}**.")
+        await self._reply(evt, f"✅ profile_mode set to **{v}**.")
 
     @webhook_profile_root.subcommand(name="prefix", help="Toggle inline fallback")
     @command.argument("args", required=True, pass_raw=True)
@@ -1116,11 +1120,11 @@ class RoomWebhooksPlugin(Plugin):
         parts = args.split()
         parts2, target = self._maybe_peel_target(parts)
         if len(parts2) < 2:
-            await evt.reply("Usage: `!webhook profile prefix <name> <on|off> [!room|#alias]`")
+            await self._reply(evt, "Usage: `!webhook profile prefix <name> <on|off> [!room|#alias]`")
             return
         name, v = parts2[0], parts2[1].lower()
         if v not in ("on", "off", "true", "false", "1", "0"):
-            await evt.reply("Invalid value: use `on|off`"); return
+            await self._reply(evt, "Invalid value: use `on|off`"); return
         flag = v in ("on", "true", "1")
         rid = await self._resolve_target_room(evt, target)
         if not rid:
@@ -1133,7 +1137,7 @@ class RoomWebhooksPlugin(Plugin):
             "UPDATE room_hooks SET profile_prefix_fallback=$1 WHERE room_id=$2 AND name=$3",
             flag, rid_s, name
         )
-        await evt.reply(f"✅ prefix_fallback **{'on' if flag else 'off'}**.")
+        await self._reply(evt, f"✅ prefix_fallback **{'on' if flag else 'off'}**.")
 
     # ---------------- web handlers ----------------
 
@@ -1462,9 +1466,9 @@ class RoomWebhooksPlugin(Plugin):
                 rid = getattr(res, "room_id", None) or res["room_id"]
                 return RoomID(rid)
             except Exception as e:
-                await evt.reply(f"Failed to resolve room alias `{target}`: {e}")
+                await self._reply(evt, f"Failed to resolve room alias `{target}`: {e}")
                 return None
-        await evt.reply("Room target must be `!roomid` or `#alias` if provided.")
+        await self._reply(evt, "Room target must be `!roomid` or `#alias` if provided.")
         return None
 
     def _maybe_peel_target(self, parts: List[str]) -> Tuple[List[str], Optional[str]]:
@@ -1480,15 +1484,37 @@ class RoomWebhooksPlugin(Plugin):
         if evt.sender in set(self.config["adminlist"] or []):
             return True
         if self.config["restrict_admin_to_local"] and not self._is_local(evt.sender):
-            await evt.reply("Only local users are allowed to do this.")
+            await self._reply(evt, "Only local users are allowed to do this.")
             return False
         if not await self._has_required_pl(rid, evt.sender):
             where = "this room" if rid == evt.room_id else f"target room `{rid}`"
-            await evt.reply(f"You need power level ≥ {self.config['pl_required']} in {where}.")
+            await self._reply(evt, f"You need power level ≥ {self.config['pl_required']} in {where}.")
             return False
         if rid != evt.room_id:
             bot_mem = await self._get_membership(rid, self.client.mxid)
             if bot_mem != "join":
-                await evt.reply(f"Bot is not joined to target room `{rid}`.")
+                await self._reply(evt, f"Bot is not joined to target room `{rid}`.")
                 return False
         return True
+
+    # ---- m.notice helpers for command output ----
+    async def _reply(self, evt: MessageEvent, text: str, markdown: bool = False):
+        """Reply to a command as m.notice so phone clients don't push-notify.
+        Renders markdown to HTML when `markdown=True`."""
+        if markdown:
+            content = TextMessageEventContent(
+                msgtype="m.notice",
+                body=text,
+                format=Format.HTML,
+                formatted_body=markdown_to_html(text),
+            )
+        else:
+            content = TextMessageEventContent(msgtype="m.notice", body=text)
+        content.set_reply(evt)
+        return await self.client.send_message(evt.room_id, content)
+
+    async def _notice(self, room_id: RoomID, text: str, markdown: bool = False):
+        """Send a notice into a room without a reply relation."""
+        if markdown:
+            return await self.client.send_markdown(room_id, text, msgtype="m.notice")
+        return await self.client.send_notice(room_id, text)
