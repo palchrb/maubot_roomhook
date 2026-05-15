@@ -29,6 +29,21 @@ def clamp_body(req: Request, max_bytes: int) -> None:
     if max_bytes and req.content_length and req.content_length > max_bytes:
         raise ValueError("payload_too_large")
 
+async def read_body_limited(req: Request, max_bytes: int) -> bytes:
+    """Read the request body, enforcing max_bytes even when Content-Length
+    is missing or lies. Streams chunks and aborts as soon as the running
+    total exceeds the cap."""
+    if max_bytes <= 0:
+        return await req.read()
+    chunks: List[bytes] = []
+    total = 0
+    async for chunk in req.content.iter_chunked(8192):
+        total += len(chunk)
+        if total > max_bytes:
+            raise ValueError("payload_too_large")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
 def parse_auth_token(req: Request, allow_query: bool) -> Optional[str]:
     h = req.headers.get(hdrs.AUTHORIZATION)
     if h and " " in h:
@@ -269,6 +284,7 @@ class PluginConfig(BaseProxyConfig):
         h.copy("allowed_methods")
         h.copy("enable_path_token_route")
         h.copy("allow_query_token")
+        h.copy("allow_html_format")
 
 # ---------------- plugin ----------------
 
@@ -287,7 +303,9 @@ class RoomWebhooksPlugin(Plugin):
     async def start(self) -> None:
         self.config.load_and_update()
         self.jinja = jinja2.Environment(autoescape=True)
-        self._rate: Dict[str, int] = {}  # simple in-memory rate bucket
+        # rate buckets: key -> (minute, count); overwritten on minute rollover
+        # so the dict is bounded by the number of unique keys, not uptime.
+        self._rate: Dict[str, Tuple[int, int]] = {}
         self.log.info(f"Webhook base URL: {self.webapp_url}")
 
     # ---- rate limiting (in-memory) ----
@@ -296,11 +314,13 @@ class RoomWebhooksPlugin(Plugin):
         if limit <= 0:
             return True
         minute = int(time.time() // 60)
-        bucket = f"{key}:{minute}"
-        count = self._rate.get(bucket, 0)
-        if count >= limit:
+        cur = self._rate.get(key)
+        if cur is None or cur[0] != minute:
+            self._rate[key] = (minute, 1)
+            return True
+        if cur[1] >= limit:
             return False
-        self._rate[bucket] = count + 1
+        self._rate[key] = (minute, cur[1] + 1)
         return True
 
     # ---- admin & local guards ----
@@ -606,8 +626,6 @@ class RoomWebhooksPlugin(Plugin):
     @webhook.subcommand(name="add", help="Create a new hook: !webhook add <name> [!room|#alias]")
     @command.argument("args", required=True, pass_raw=True)
     async def webhook_add(self, evt: MessageEvent, args: str) -> None:
-        if not await self._check_admin_here(evt):
-            return
         parts = args.split()
         if not parts:
             await evt.reply("Usage: `!webhook add <name> [!room|#alias]`")
@@ -619,6 +637,8 @@ class RoomWebhooksPlugin(Plugin):
         name = parts2[0]
         rid = await self._resolve_target_room(evt, target)
         if not rid:
+            return
+        if not await self._check_admin_here(evt, rid):
             return
 
         rid_s = str(rid)
@@ -674,8 +694,6 @@ class RoomWebhooksPlugin(Plugin):
     @webhook.subcommand(name="save", help="Redact the token message")
     @command.argument("args", required=True, pass_raw=True)
     async def webhook_save(self, evt: MessageEvent, args: str) -> None:
-        if not await self._check_admin_here(evt):
-            return
         parts = args.split()
         if not parts:
             await evt.reply("Usage: `!webhook save <name> [!room|#alias]`")
@@ -684,6 +702,8 @@ class RoomWebhooksPlugin(Plugin):
         name = parts2[0]
         rid = await self._resolve_target_room(evt, target)
         if not rid:
+            return
+        if not await self._check_admin_here(evt, rid):
             return
 
         rid_s = str(rid)
@@ -708,8 +728,6 @@ class RoomWebhooksPlugin(Plugin):
     @webhook.subcommand(name="rotate", help="Rotate token")
     @command.argument("args", required=True, pass_raw=True)
     async def webhook_rotate(self, evt: MessageEvent, args: str) -> None:
-        if not await self._check_admin_here(evt):
-            return
         parts = args.split()
         if not parts:
             await evt.reply("Usage: `!webhook rotate <name> [!room|#alias]`")
@@ -718,6 +736,8 @@ class RoomWebhooksPlugin(Plugin):
         name = parts2[0]
         rid = await self._resolve_target_room(evt, target)
         if not rid:
+            return
+        if not await self._check_admin_here(evt, rid):
             return
         rid_s = str(rid)
 
@@ -753,8 +773,6 @@ class RoomWebhooksPlugin(Plugin):
     @webhook.subcommand(name="revoke", help="Disable a hook")
     @command.argument("args", required=True, pass_raw=True)
     async def webhook_revoke(self, evt: MessageEvent, args: str) -> None:
-        if not await self._check_admin_here(evt):
-            return
         parts = args.split()
         if not parts:
             await evt.reply("Usage: `!webhook revoke <name> [!room|#alias]`")
@@ -763,6 +781,8 @@ class RoomWebhooksPlugin(Plugin):
         name = parts2[0]
         rid = await self._resolve_target_room(evt, target)
         if not rid:
+            return
+        if not await self._check_admin_here(evt, rid):
             return
         rid_s = str(rid)
 
@@ -816,8 +836,6 @@ class RoomWebhooksPlugin(Plugin):
     @webhook.subcommand(name="delete", help="Permanently delete a hook")
     @command.argument("args", required=True, pass_raw=True)
     async def webhook_delete(self, evt: MessageEvent, args: str) -> None:
-        if not await self._check_admin_here(evt):
-            return
         parts = args.split()
         if not parts:
             await evt.reply("Usage: `!webhook delete <name> [!room|#alias]`")
@@ -826,6 +844,8 @@ class RoomWebhooksPlugin(Plugin):
         name = parts2[0]
         rid = await self._resolve_target_room(evt, target)
         if not rid:
+            return
+        if not await self._check_admin_here(evt, rid):
             return
 
         rid_s = str(rid)
@@ -847,8 +867,6 @@ class RoomWebhooksPlugin(Plugin):
     @webhook.subcommand(name="set", help="Set per-hook format/type/raw: !webhook set <name> <fmt|type|raw> <value> [!room|#alias]")
     @command.argument("args", pass_raw=True, required=False)
     async def webhook_set(self, evt: MessageEvent, args: Optional[str] = None) -> None:
-        if not await self._check_admin_here(evt):
-            return
         if not args:
             await evt.reply("Usage: `!webhook set <name> <fmt|type|raw> <value> [!room|#alias]`")
             return
@@ -862,6 +880,8 @@ class RoomWebhooksPlugin(Plugin):
         name, key, value = parts2[0], parts2[1].lower(), " ".join(parts2[2:])
         rid = await self._resolve_target_room(evt, target)
         if not rid:
+            return
+        if not await self._check_admin_here(evt, rid):
             return
         rid_s = str(rid)
 
@@ -900,8 +920,6 @@ class RoomWebhooksPlugin(Plugin):
     @webhook.subcommand(name="tpl", help="Template: !webhook tpl <name> reset|message <code> [!room|#alias]")
     @command.argument("args", pass_raw=True, required=False)
     async def webhook_tpl(self, evt: MessageEvent, args: Optional[str] = None) -> None:
-        if not await self._check_admin_here(evt):
-            return
         if not args:
             await evt.reply("Usage: `!webhook tpl <name> reset|message <code> [!room|#alias]`")
             return
@@ -921,6 +939,8 @@ class RoomWebhooksPlugin(Plugin):
         # For 'reset', we don't need a body
         rid = await self._resolve_target_room(evt, target)
         if not rid:
+            return
+        if not await self._check_admin_here(evt, rid):
             return
         rid_s = str(rid)
 
@@ -1011,8 +1031,6 @@ class RoomWebhooksPlugin(Plugin):
     @webhook_profile_root.subcommand(name="set", help="Set displayname and optional avatar")
     @command.argument("args", required=True, pass_raw=True)
     async def webhook_profile_set(self, evt: MessageEvent, args: str) -> None:
-        if not await self._check_admin_here(evt):
-            return
         parts = args.split()
         parts2, target = self._maybe_peel_target(parts)
         if len(parts2) < 2:
@@ -1023,6 +1041,8 @@ class RoomWebhooksPlugin(Plugin):
         avatar_mxc = parts2[2] if len(parts2) >= 3 else None
         rid = await self._resolve_target_room(evt, target)
         if not rid:
+            return
+        if not await self._check_admin_here(evt, rid):
             return
         rid_s = str(rid)
 
@@ -1040,8 +1060,6 @@ class RoomWebhooksPlugin(Plugin):
     @webhook_profile_root.subcommand(name="reset", help="Reset profile to label/no avatar")
     @command.argument("args", required=True, pass_raw=True)
     async def webhook_profile_reset(self, evt: MessageEvent, args: str) -> None:
-        if not await self._check_admin_here(evt):
-            return
         parts = args.split()
         parts2, target = self._maybe_peel_target(parts)
         if not parts2:
@@ -1050,6 +1068,8 @@ class RoomWebhooksPlugin(Plugin):
         name = parts2[0]
         rid = await self._resolve_target_room(evt, target)
         if not rid:
+            return
+        if not await self._check_admin_here(evt, rid):
             return
         rid_s = str(rid)
 
@@ -1069,8 +1089,6 @@ class RoomWebhooksPlugin(Plugin):
     @webhook_profile_root.subcommand(name="mode", help="Set profile mode")
     @command.argument("args", required=True, pass_raw=True)
     async def webhook_profile_mode(self, evt: MessageEvent, args: str) -> None:
-        if not await self._check_admin_here(evt):
-            return
         parts = args.split()
         parts2, target = self._maybe_peel_target(parts)
         if len(parts2) < 2:
@@ -1081,6 +1099,8 @@ class RoomWebhooksPlugin(Plugin):
             await evt.reply("Invalid mode: use `static|email_from`"); return
         rid = await self._resolve_target_room(evt, target)
         if not rid:
+            return
+        if not await self._check_admin_here(evt, rid):
             return
         rid_s = str(rid)
 
@@ -1093,8 +1113,6 @@ class RoomWebhooksPlugin(Plugin):
     @webhook_profile_root.subcommand(name="prefix", help="Toggle inline fallback")
     @command.argument("args", required=True, pass_raw=True)
     async def webhook_profile_prefix(self, evt: MessageEvent, args: str) -> None:
-        if not await self._check_admin_here(evt):
-            return
         parts = args.split()
         parts2, target = self._maybe_peel_target(parts)
         if len(parts2) < 2:
@@ -1107,6 +1125,8 @@ class RoomWebhooksPlugin(Plugin):
         rid = await self._resolve_target_room(evt, target)
         if not rid:
             return
+        if not await self._check_admin_here(evt, rid):
+            return
         rid_s = str(rid)
 
         await self.database.execute(
@@ -1117,9 +1137,9 @@ class RoomWebhooksPlugin(Plugin):
 
     # ---------------- web handlers ----------------
 
-    async def _parse_body(self, req: Request) -> Dict[str, Any]:
+    async def _parse_body(self, req: Request, max_bytes: int = 0) -> Dict[str, Any]:
         ctype = (req.headers.get("Content-Type") or "").lower()
-        raw = await req.read()
+        raw = await read_body_limited(req, max_bytes)
         text = raw.decode(errors="replace")
 
         # If explicitly JSON, try JSON but fallback safely
@@ -1155,55 +1175,44 @@ class RoomWebhooksPlugin(Plugin):
             }
 
 
-    @web.post("/send")
-    async def handle_send(self, req: Request) -> Response:
+    async def _run_webhook(self, req: Request, token: Optional[str]) -> Response:
         if req.method not in set(self.config["allowed_methods"] or []):
             return Response(status=405, text="method_not_allowed")
+        max_bytes = int(self.config["max_body_bytes"] or 0)
         try:
-            clamp_body(req, int(self.config["max_body_bytes"] or 0))
+            clamp_body(req, max_bytes)
         except ValueError:
             return Response(status=413, text="payload_too_large")
 
-        token = parse_auth_token(req, self.config["allow_query_token"])
         if not token:
             return Response(status=401, text="missing_token")
 
-        if not self._rate_ok(f"tok:{token[:10]}"):
+        if not self._rate_ok(f"tok:{sha256_hex(token)[:16]}"):
             return Response(status=429, text="rate_limited")
 
         try:
-            data = await self._parse_body(req)
+            data = await self._parse_body(req, max_bytes)
         except ValueError as e:
-            return Response(status=400, text=str(e))
+            msg = str(e)
+            status = 413 if msg == "payload_too_large" else 400
+            return Response(status=status, text=msg)
 
         ok, err = await self._deliver_by_token(token, data)
         if not ok:
             return self._err_to_resp(err)
         return Response(status=204)
+
+    @web.post("/send")
+    async def handle_send(self, req: Request) -> Response:
+        token = parse_auth_token(req, self.config["allow_query_token"])
+        return await self._run_webhook(req, token)
 
     @web.post("/hook/{token}")
     async def handle_hook_token(self, req: Request) -> Response:
-        if req.method not in set(self.config["allowed_methods"] or []):
-            return Response(status=405, text="method_not_allowed")
-        try:
-            clamp_body(req, int(self.config["max_body_bytes"] or 0))
-        except ValueError:
-            return Response(status=413, text="payload_too_large")
-
+        if not self.config["enable_path_token_route"]:
+            return Response(status=404, text="not_found")
         token = req.match_info["token"]
-
-        if not self._rate_ok(f"tok:{token[:10]}"):
-            return Response(status=429, text="rate_limited")
-
-        try:
-            data = await self._parse_body(req)
-        except ValueError as e:
-            return Response(status=400, text=str(e))
-
-        ok, err = await self._deliver_by_token(token, data)
-        if not ok:
-            return self._err_to_resp(err)
-        return Response(status=204)
+        return await self._run_webhook(req, token)
 
     def _err_to_resp(self, err: Optional[str]) -> Response:
         if err == "bad_token":
@@ -1287,16 +1296,29 @@ class RoomWebhooksPlugin(Plugin):
         final_av = stored_avatar if stored_avatar.startswith("mxc://") else ""
         return final_id, final_dn, final_av
 
+    @staticmethod
+    def _make_prefix_html(displayname: str) -> str:
+        return f'<strong data-mx-profile-fallback>{html.escape(displayname)}: </strong>'
+
+    @staticmethod
+    def _wrap_html_with_prefix(inner: str, prefix: str, inject_into_p: bool = False) -> str:
+        """Prepend `prefix` to already-HTML `inner`. When `inject_into_p` is
+        true and `inner` opens with `<p>`, the prefix is injected inside
+        that paragraph (so the markdown renderer's own `<p>` wrapper isn't
+        double-wrapped). For other block-level openings emit
+        `<p>prefix</p>inner`; for inline content emit `<p>prefix inner</p>`."""
+        inner_stripped = inner.lstrip().lower()
+        if inject_into_p and inner_stripped.startswith("<p"):
+            return re.sub(r"(?i)^(\s*<p\s*>)", r"\1" + prefix, inner, count=1)
+        if any(inner_stripped.startswith(tag) for tag in MD_BLOCK_TAGS):
+            return f"<p>{prefix}</p>{inner}"
+        return f"<p>{prefix}{inner}</p>"
+
     def _build_plain_and_html(self, displayname: str, content: str, fmt: str, prefix_enabled: bool) -> Tuple[str, str]:
         if fmt == "html":
             inner = str(content)
             if prefix_enabled:
-                prefix = f'<strong data-mx-profile-fallback>{html.escape(displayname)}: </strong>'
-                inner_stripped = inner.lstrip().lower()
-                if any(inner_stripped.startswith(tag) for tag in MD_BLOCK_TAGS):
-                    html_body = f"<p>{prefix}</p>{inner}"
-                else:
-                    html_body = f"<p>{prefix}{inner}</p>"
+                html_body = self._wrap_html_with_prefix(inner, self._make_prefix_html(displayname))
                 plain = f"{displayname}: {self._strip_html_to_plain(inner)}"
             else:
                 html_body = inner
@@ -1306,33 +1328,19 @@ class RoomWebhooksPlugin(Plugin):
         if fmt == "markdown":
             inner = markdown_to_html(str(content))
             if prefix_enabled:
-                prefix = f'<strong data-mx-profile-fallback>{html.escape(displayname)}: </strong>'
-                inner_stripped = inner.lstrip().lower()
-
-                # NEW: avoid wrapping markdown HTML that already starts with <p
-                if inner_stripped.startswith("<p"):
-                    # inject prefix right after the opening <p>
-                    inner = re.sub(
-                        r"(?i)^(\s*<p\s*>)",
-                        r"\1" + prefix,
-                        inner,
-                        count=1,
-                    )
-                    html_body = inner
-                elif any(inner_stripped.startswith(tag) for tag in MD_BLOCK_TAGS):
-                    html_body = f"<p>{prefix}</p>{inner}"
-                else:
-                    html_body = f"<p>{prefix}{inner}</p>"
-
+                html_body = self._wrap_html_with_prefix(
+                    inner, self._make_prefix_html(displayname), inject_into_p=True
+                )
                 plain = f"{displayname}: {str(content)}"
             else:
                 html_body = inner
                 plain = str(content)
             return plain, html_body
 
+        # plaintext
         esc = html.escape(str(content))
         if prefix_enabled:
-            html_body = f"<p><strong data-mx-profile-fallback>{html.escape(displayname)}: </strong>{esc}</p>"
+            html_body = f"<p>{self._make_prefix_html(displayname)}{esc}</p>"
             plain = f"{displayname}: {str(content)}"
         else:
             html_body = f"<p>{esc}</p>"
@@ -1347,11 +1355,18 @@ class RoomWebhooksPlugin(Plugin):
         s = html.unescape(s)
         return s
 
-    async def _render_and_send(self, row, data: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+    async def _render_and_send(self, row: Dict[str, Any], data: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
         room = RoomID(row["room_id"])
         fmt = (row["fmt"] or self.config["message_format"]).lower()
         msgtype = (row["msgtype"] or self.config["message_type"])
         prefix_enabled = bool(row.get("profile_prefix_fallback", True))
+        allow_html = bool(self.config["allow_html_format"])
+        if fmt == "html" and not allow_html:
+            self.log.warning(
+                f"Hook {row['room_id']}/{row['name']} has fmt=html but "
+                f"allow_html_format is disabled; falling back to plaintext"
+            )
+            fmt = "plaintext"
 
         tpl_src = row["msg_tpl"]
         if tpl_src:
@@ -1377,7 +1392,7 @@ class RoomWebhooksPlugin(Plugin):
                     return False, err
             return True, None
 
-        if "html" in data and data["html"] is not None:
+        if "html" in data and data["html"] is not None and fmt == "html":
             ok, err = await self._send_profiled_content(room, row, str(data["html"]), "html", msgtype, data, prefix_enabled)
             return (ok, err)
 
@@ -1425,8 +1440,12 @@ class RoomWebhooksPlugin(Plugin):
             }
             await self.client.send_message(room, mec)
             return True, None
-        except Exception:
-            self.log.exception("Send failed")
+        except Exception as e:
+            self.log.warning(
+                f"Send failed for {row.get('room_id')}/{row.get('name')}: "
+                f"{type(e).__name__}: {e}"
+            )
+            self.log.debug("Send failure traceback:", exc_info=True)
             return False, "send_failed"
 
     # --------- TARGET ROOM HELPERS ---------
@@ -1456,13 +1475,20 @@ class RoomWebhooksPlugin(Plugin):
             return parts[:-1], last
         return parts, None
 
-    async def _check_admin_here(self, evt: MessageEvent) -> bool:
+    async def _check_admin_here(self, evt: MessageEvent, room_id: Optional[RoomID] = None) -> bool:
+        rid = room_id or evt.room_id
         if evt.sender in set(self.config["adminlist"] or []):
             return True
         if self.config["restrict_admin_to_local"] and not self._is_local(evt.sender):
             await evt.reply("Only local users are allowed to do this.")
             return False
-        if not await self._has_required_pl(evt.room_id, evt.sender):
-            await evt.reply(f"You need power level ≥ {self.config['pl_required']} in this room.")
+        if not await self._has_required_pl(rid, evt.sender):
+            where = "this room" if rid == evt.room_id else f"target room `{rid}`"
+            await evt.reply(f"You need power level ≥ {self.config['pl_required']} in {where}.")
             return False
+        if rid != evt.room_id:
+            bot_mem = await self._get_membership(rid, self.client.mxid)
+            if bot_mem != "join":
+                await evt.reply(f"Bot is not joined to target room `{rid}`.")
+                return False
         return True
