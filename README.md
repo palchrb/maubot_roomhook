@@ -34,4 +34,21 @@ you do.
 
 Works in v12 rooms since Maubot works in v12 rooms..
 
+### Install
+
+Grab the latest `.mbp` from the
+[Releases](https://github.com/palchrb/maubot_roomhook/releases) page
+and upload it to your maubot instance via the web UI. A new release
+is built automatically when the `version` field in `maubot.yaml`
+is bumped on `main`.
+
+### Build from source
+
+```sh
+zip -r vibb.me.roomwebhooks.mbp maubot.yaml base-config.yaml plugin \
+    -x 'plugin/__pycache__/*' 'plugin/*.pyc'
+```
+
+Then upload the resulting `.mbp` to maubot.
+
 Feel free to contact me [on Matrix](https://matrix.to/#/#whatever:vibb.me)
