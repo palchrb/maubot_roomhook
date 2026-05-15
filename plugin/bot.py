@@ -269,6 +269,7 @@ class PluginConfig(BaseProxyConfig):
         h.copy("allowed_methods")
         h.copy("enable_path_token_route")
         h.copy("allow_query_token")
+        h.copy("allow_html_format")
 
 # ---------------- plugin ----------------
 
@@ -1347,11 +1348,18 @@ class RoomWebhooksPlugin(Plugin):
         s = html.unescape(s)
         return s
 
-    async def _render_and_send(self, row, data: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+    async def _render_and_send(self, row: Dict[str, Any], data: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
         room = RoomID(row["room_id"])
         fmt = (row["fmt"] or self.config["message_format"]).lower()
         msgtype = (row["msgtype"] or self.config["message_type"])
         prefix_enabled = bool(row.get("profile_prefix_fallback", True))
+        allow_html = bool(self.config["allow_html_format"])
+        if fmt == "html" and not allow_html:
+            self.log.warning(
+                f"Hook {row['room_id']}/{row['name']} has fmt=html but "
+                f"allow_html_format is disabled; falling back to plaintext"
+            )
+            fmt = "plaintext"
 
         tpl_src = row["msg_tpl"]
         if tpl_src:
@@ -1377,7 +1385,7 @@ class RoomWebhooksPlugin(Plugin):
                     return False, err
             return True, None
 
-        if "html" in data and data["html"] is not None:
+        if "html" in data and data["html"] is not None and fmt == "html":
             ok, err = await self._send_profiled_content(room, row, str(data["html"]), "html", msgtype, data, prefix_enabled)
             return (ok, err)
 

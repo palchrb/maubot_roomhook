@@ -12,3 +12,9 @@ max_body_bytes: 0
 allowed_methods: ["POST"]
 enable_path_token_route: true
 allow_query_token: true
+
+# Allow per-hook fmt=html and the `"html"` payload shortcut. When true,
+# webhook payloads can send arbitrary HTML into the room's formatted_body
+# (no sanitisation beyond what Matrix clients themselves enforce). Leave
+# disabled unless you fully trust every webhook source.
+allow_html_format: false
