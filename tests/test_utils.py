@@ -13,6 +13,7 @@ from plugin.bot import (
     parse_email_from,
     markdown_to_html,
     _escape_html,
+    RoomWebhooksPlugin,
 )
 
 
@@ -173,3 +174,34 @@ def test_escape_html_leaves_quotes_alone():
     # The plugin uses quote=False so " and ' are preserved.
     assert _escape_html('a"b') == 'a"b'
     assert _escape_html("a'b") == "a'b"
+
+
+# ---- _make_prefix_html / _wrap_html_with_prefix ----
+
+def test_make_prefix_html_escapes_displayname():
+    out = RoomWebhooksPlugin._make_prefix_html("<script>")
+    assert "&lt;script&gt;" in out
+    assert "<strong data-mx-profile-fallback>" in out
+
+
+def test_wrap_inline_content_gets_p_with_prefix():
+    out = RoomWebhooksPlugin._wrap_html_with_prefix("hello", "PRE: ")
+    assert out == "<p>PRE: hello</p>"
+
+
+def test_wrap_block_content_gets_separate_p():
+    out = RoomWebhooksPlugin._wrap_html_with_prefix("<pre>code</pre>", "PRE: ")
+    assert out == "<p>PRE: </p><pre>code</pre>"
+
+
+def test_wrap_p_content_injects_into_existing_p_when_requested():
+    out = RoomWebhooksPlugin._wrap_html_with_prefix("<p>hi</p>", "PRE: ", inject_into_p=True)
+    assert out == "<p>PRE: hi</p>"
+
+
+def test_wrap_p_content_without_inject_treats_as_inline():
+    # `<p` is not in MD_BLOCK_TAGS, so without inject_into_p the helper
+    # takes the inline branch. This matches the existing html-fmt
+    # behaviour before the refactor.
+    out = RoomWebhooksPlugin._wrap_html_with_prefix("<p>hi</p>", "PRE: ")
+    assert out == "<p>PRE: <p>hi</p></p>"

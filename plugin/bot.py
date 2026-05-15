@@ -1296,16 +1296,29 @@ class RoomWebhooksPlugin(Plugin):
         final_av = stored_avatar if stored_avatar.startswith("mxc://") else ""
         return final_id, final_dn, final_av
 
+    @staticmethod
+    def _make_prefix_html(displayname: str) -> str:
+        return f'<strong data-mx-profile-fallback>{html.escape(displayname)}: </strong>'
+
+    @staticmethod
+    def _wrap_html_with_prefix(inner: str, prefix: str, inject_into_p: bool = False) -> str:
+        """Prepend `prefix` to already-HTML `inner`. When `inject_into_p` is
+        true and `inner` opens with `<p>`, the prefix is injected inside
+        that paragraph (so the markdown renderer's own `<p>` wrapper isn't
+        double-wrapped). For other block-level openings emit
+        `<p>prefix</p>inner`; for inline content emit `<p>prefix inner</p>`."""
+        inner_stripped = inner.lstrip().lower()
+        if inject_into_p and inner_stripped.startswith("<p"):
+            return re.sub(r"(?i)^(\s*<p\s*>)", r"\1" + prefix, inner, count=1)
+        if any(inner_stripped.startswith(tag) for tag in MD_BLOCK_TAGS):
+            return f"<p>{prefix}</p>{inner}"
+        return f"<p>{prefix}{inner}</p>"
+
     def _build_plain_and_html(self, displayname: str, content: str, fmt: str, prefix_enabled: bool) -> Tuple[str, str]:
         if fmt == "html":
             inner = str(content)
             if prefix_enabled:
-                prefix = f'<strong data-mx-profile-fallback>{html.escape(displayname)}: </strong>'
-                inner_stripped = inner.lstrip().lower()
-                if any(inner_stripped.startswith(tag) for tag in MD_BLOCK_TAGS):
-                    html_body = f"<p>{prefix}</p>{inner}"
-                else:
-                    html_body = f"<p>{prefix}{inner}</p>"
+                html_body = self._wrap_html_with_prefix(inner, self._make_prefix_html(displayname))
                 plain = f"{displayname}: {self._strip_html_to_plain(inner)}"
             else:
                 html_body = inner
@@ -1315,33 +1328,19 @@ class RoomWebhooksPlugin(Plugin):
         if fmt == "markdown":
             inner = markdown_to_html(str(content))
             if prefix_enabled:
-                prefix = f'<strong data-mx-profile-fallback>{html.escape(displayname)}: </strong>'
-                inner_stripped = inner.lstrip().lower()
-
-                # NEW: avoid wrapping markdown HTML that already starts with <p
-                if inner_stripped.startswith("<p"):
-                    # inject prefix right after the opening <p>
-                    inner = re.sub(
-                        r"(?i)^(\s*<p\s*>)",
-                        r"\1" + prefix,
-                        inner,
-                        count=1,
-                    )
-                    html_body = inner
-                elif any(inner_stripped.startswith(tag) for tag in MD_BLOCK_TAGS):
-                    html_body = f"<p>{prefix}</p>{inner}"
-                else:
-                    html_body = f"<p>{prefix}{inner}</p>"
-
+                html_body = self._wrap_html_with_prefix(
+                    inner, self._make_prefix_html(displayname), inject_into_p=True
+                )
                 plain = f"{displayname}: {str(content)}"
             else:
                 html_body = inner
                 plain = str(content)
             return plain, html_body
 
+        # plaintext
         esc = html.escape(str(content))
         if prefix_enabled:
-            html_body = f"<p><strong data-mx-profile-fallback>{html.escape(displayname)}: </strong>{esc}</p>"
+            html_body = f"<p>{self._make_prefix_html(displayname)}{esc}</p>"
             plain = f"{displayname}: {str(content)}"
         else:
             html_body = f"<p>{esc}</p>"
@@ -1441,8 +1440,12 @@ class RoomWebhooksPlugin(Plugin):
             }
             await self.client.send_message(room, mec)
             return True, None
-        except Exception:
-            self.log.exception("Send failed")
+        except Exception as e:
+            self.log.warning(
+                f"Send failed for {row.get('room_id')}/{row.get('name')}: "
+                f"{type(e).__name__}: {e}"
+            )
+            self.log.debug("Send failure traceback:", exc_info=True)
             return False, "send_failed"
 
     # --------- TARGET ROOM HELPERS ---------

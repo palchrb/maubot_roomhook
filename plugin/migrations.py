@@ -66,3 +66,7 @@ async def upgrade_v5(conn: Connection, scheme: Scheme) -> None:
         await conn.execute("ALTER TABLE room_hooks ADD COLUMN IF NOT EXISTS profile_prefix_fallback INTEGER DEFAULT 1")
     else:
         await conn.execute("ALTER TABLE room_hooks ADD COLUMN IF NOT EXISTS profile_prefix_fallback BOOLEAN DEFAULT TRUE")
+
+@upgrade_table.register(description="Index on room_id for list queries")
+async def upgrade_v6(conn: Connection, scheme: Scheme) -> None:
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_room_hooks_room_id ON room_hooks (room_id)")
