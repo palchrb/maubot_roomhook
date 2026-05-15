@@ -1,0 +1,126 @@
+name: Build and release
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Lint and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install maubot pytest pytest-asyncio pyyaml
+
+      - name: Compile plugin sources
+        run: python -m compileall -q plugin
+
+      - name: Validate YAML manifests
+        run: |
+          python - <<'PY'
+          import yaml
+          for path in ("maubot.yaml", "base-config.yaml"):
+              with open(path) as f:
+                  yaml.safe_load(f)
+              print(f"ok: {path}")
+          PY
+
+      - name: Run unit tests
+        run: pytest -q tests
+
+  build-and-release:
+    name: Build .mbp and release
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install build tooling
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyyaml
+
+      - name: Read plugin id and version from maubot.yaml
+        id: meta
+        run: |
+          VERSION=$(python -c "import yaml; print(yaml.safe_load(open('maubot.yaml'))['version'])")
+          PLUGIN_ID=$(python -c "import yaml; print(yaml.safe_load(open('maubot.yaml'))['id'])")
+          {
+            echo "version=$VERSION"
+            echo "plugin_id=$PLUGIN_ID"
+            echo "tag=v$VERSION"
+            echo "artifact=${PLUGIN_ID}-v${VERSION}.mbp"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check if release already exists
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "${{ steps.meta.outputs.tag }}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Release ${{ steps.meta.outputs.tag }} already exists — skipping build/publish."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build .mbp
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          mkdir -p dist
+          # A maubot plugin file is just a zip with the manifest at the
+          # root, the listed modules, and any extra_files. Rename to .mbp.
+          zip -r "dist/${{ steps.meta.outputs.artifact }}" \
+              maubot.yaml base-config.yaml plugin \
+              -x 'plugin/__pycache__/*' 'plugin/*.pyc'
+          echo "--- artifact contents ---"
+          unzip -l "dist/${{ steps.meta.outputs.artifact }}"
+
+      - name: Sanity-check artifact contents
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          ART="dist/${{ steps.meta.outputs.artifact }}"
+          for required in maubot.yaml base-config.yaml plugin/__init__.py plugin/bot.py plugin/migrations.py; do
+            if ! unzip -l "$ART" | grep -q " $required\$"; then
+              echo "MISSING in artifact: $required"
+              exit 1
+            fi
+          done
+          echo "All required files present."
+
+      - name: Create GitHub release
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ steps.meta.outputs.tag }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "${{ steps.meta.outputs.tag }}" \
+            --notes "Automated release for maubot.yaml version ${{ steps.meta.outputs.version }}.
+
+          Built from \`$GITHUB_SHA\`. Install via maubot's web UI by uploading the \`.mbp\` asset below." \
+            "dist/${{ steps.meta.outputs.artifact }}"
