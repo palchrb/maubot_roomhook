@@ -606,8 +606,6 @@ class RoomWebhooksPlugin(Plugin):
     @webhook.subcommand(name="add", help="Create a new hook: !webhook add <name> [!room|#alias]")
     @command.argument("args", required=True, pass_raw=True)
     async def webhook_add(self, evt: MessageEvent, args: str) -> None:
-        if not await self._check_admin_here(evt):
-            return
         parts = args.split()
         if not parts:
             await evt.reply("Usage: `!webhook add <name> [!room|#alias]`")
@@ -619,6 +617,8 @@ class RoomWebhooksPlugin(Plugin):
         name = parts2[0]
         rid = await self._resolve_target_room(evt, target)
         if not rid:
+            return
+        if not await self._check_admin_here(evt, rid):
             return
 
         rid_s = str(rid)
@@ -674,8 +674,6 @@ class RoomWebhooksPlugin(Plugin):
     @webhook.subcommand(name="save", help="Redact the token message")
     @command.argument("args", required=True, pass_raw=True)
     async def webhook_save(self, evt: MessageEvent, args: str) -> None:
-        if not await self._check_admin_here(evt):
-            return
         parts = args.split()
         if not parts:
             await evt.reply("Usage: `!webhook save <name> [!room|#alias]`")
@@ -684,6 +682,8 @@ class RoomWebhooksPlugin(Plugin):
         name = parts2[0]
         rid = await self._resolve_target_room(evt, target)
         if not rid:
+            return
+        if not await self._check_admin_here(evt, rid):
             return
 
         rid_s = str(rid)
@@ -708,8 +708,6 @@ class RoomWebhooksPlugin(Plugin):
     @webhook.subcommand(name="rotate", help="Rotate token")
     @command.argument("args", required=True, pass_raw=True)
     async def webhook_rotate(self, evt: MessageEvent, args: str) -> None:
-        if not await self._check_admin_here(evt):
-            return
         parts = args.split()
         if not parts:
             await evt.reply("Usage: `!webhook rotate <name> [!room|#alias]`")
@@ -718,6 +716,8 @@ class RoomWebhooksPlugin(Plugin):
         name = parts2[0]
         rid = await self._resolve_target_room(evt, target)
         if not rid:
+            return
+        if not await self._check_admin_here(evt, rid):
             return
         rid_s = str(rid)
 
@@ -753,8 +753,6 @@ class RoomWebhooksPlugin(Plugin):
     @webhook.subcommand(name="revoke", help="Disable a hook")
     @command.argument("args", required=True, pass_raw=True)
     async def webhook_revoke(self, evt: MessageEvent, args: str) -> None:
-        if not await self._check_admin_here(evt):
-            return
         parts = args.split()
         if not parts:
             await evt.reply("Usage: `!webhook revoke <name> [!room|#alias]`")
@@ -763,6 +761,8 @@ class RoomWebhooksPlugin(Plugin):
         name = parts2[0]
         rid = await self._resolve_target_room(evt, target)
         if not rid:
+            return
+        if not await self._check_admin_here(evt, rid):
             return
         rid_s = str(rid)
 
@@ -816,8 +816,6 @@ class RoomWebhooksPlugin(Plugin):
     @webhook.subcommand(name="delete", help="Permanently delete a hook")
     @command.argument("args", required=True, pass_raw=True)
     async def webhook_delete(self, evt: MessageEvent, args: str) -> None:
-        if not await self._check_admin_here(evt):
-            return
         parts = args.split()
         if not parts:
             await evt.reply("Usage: `!webhook delete <name> [!room|#alias]`")
@@ -826,6 +824,8 @@ class RoomWebhooksPlugin(Plugin):
         name = parts2[0]
         rid = await self._resolve_target_room(evt, target)
         if not rid:
+            return
+        if not await self._check_admin_here(evt, rid):
             return
 
         rid_s = str(rid)
@@ -847,8 +847,6 @@ class RoomWebhooksPlugin(Plugin):
     @webhook.subcommand(name="set", help="Set per-hook format/type/raw: !webhook set <name> <fmt|type|raw> <value> [!room|#alias]")
     @command.argument("args", pass_raw=True, required=False)
     async def webhook_set(self, evt: MessageEvent, args: Optional[str] = None) -> None:
-        if not await self._check_admin_here(evt):
-            return
         if not args:
             await evt.reply("Usage: `!webhook set <name> <fmt|type|raw> <value> [!room|#alias]`")
             return
@@ -862,6 +860,8 @@ class RoomWebhooksPlugin(Plugin):
         name, key, value = parts2[0], parts2[1].lower(), " ".join(parts2[2:])
         rid = await self._resolve_target_room(evt, target)
         if not rid:
+            return
+        if not await self._check_admin_here(evt, rid):
             return
         rid_s = str(rid)
 
@@ -900,8 +900,6 @@ class RoomWebhooksPlugin(Plugin):
     @webhook.subcommand(name="tpl", help="Template: !webhook tpl <name> reset|message <code> [!room|#alias]")
     @command.argument("args", pass_raw=True, required=False)
     async def webhook_tpl(self, evt: MessageEvent, args: Optional[str] = None) -> None:
-        if not await self._check_admin_here(evt):
-            return
         if not args:
             await evt.reply("Usage: `!webhook tpl <name> reset|message <code> [!room|#alias]`")
             return
@@ -921,6 +919,8 @@ class RoomWebhooksPlugin(Plugin):
         # For 'reset', we don't need a body
         rid = await self._resolve_target_room(evt, target)
         if not rid:
+            return
+        if not await self._check_admin_here(evt, rid):
             return
         rid_s = str(rid)
 
@@ -1011,8 +1011,6 @@ class RoomWebhooksPlugin(Plugin):
     @webhook_profile_root.subcommand(name="set", help="Set displayname and optional avatar")
     @command.argument("args", required=True, pass_raw=True)
     async def webhook_profile_set(self, evt: MessageEvent, args: str) -> None:
-        if not await self._check_admin_here(evt):
-            return
         parts = args.split()
         parts2, target = self._maybe_peel_target(parts)
         if len(parts2) < 2:
@@ -1023,6 +1021,8 @@ class RoomWebhooksPlugin(Plugin):
         avatar_mxc = parts2[2] if len(parts2) >= 3 else None
         rid = await self._resolve_target_room(evt, target)
         if not rid:
+            return
+        if not await self._check_admin_here(evt, rid):
             return
         rid_s = str(rid)
 
@@ -1040,8 +1040,6 @@ class RoomWebhooksPlugin(Plugin):
     @webhook_profile_root.subcommand(name="reset", help="Reset profile to label/no avatar")
     @command.argument("args", required=True, pass_raw=True)
     async def webhook_profile_reset(self, evt: MessageEvent, args: str) -> None:
-        if not await self._check_admin_here(evt):
-            return
         parts = args.split()
         parts2, target = self._maybe_peel_target(parts)
         if not parts2:
@@ -1050,6 +1048,8 @@ class RoomWebhooksPlugin(Plugin):
         name = parts2[0]
         rid = await self._resolve_target_room(evt, target)
         if not rid:
+            return
+        if not await self._check_admin_here(evt, rid):
             return
         rid_s = str(rid)
 
@@ -1069,8 +1069,6 @@ class RoomWebhooksPlugin(Plugin):
     @webhook_profile_root.subcommand(name="mode", help="Set profile mode")
     @command.argument("args", required=True, pass_raw=True)
     async def webhook_profile_mode(self, evt: MessageEvent, args: str) -> None:
-        if not await self._check_admin_here(evt):
-            return
         parts = args.split()
         parts2, target = self._maybe_peel_target(parts)
         if len(parts2) < 2:
@@ -1081,6 +1079,8 @@ class RoomWebhooksPlugin(Plugin):
             await evt.reply("Invalid mode: use `static|email_from`"); return
         rid = await self._resolve_target_room(evt, target)
         if not rid:
+            return
+        if not await self._check_admin_here(evt, rid):
             return
         rid_s = str(rid)
 
@@ -1093,8 +1093,6 @@ class RoomWebhooksPlugin(Plugin):
     @webhook_profile_root.subcommand(name="prefix", help="Toggle inline fallback")
     @command.argument("args", required=True, pass_raw=True)
     async def webhook_profile_prefix(self, evt: MessageEvent, args: str) -> None:
-        if not await self._check_admin_here(evt):
-            return
         parts = args.split()
         parts2, target = self._maybe_peel_target(parts)
         if len(parts2) < 2:
@@ -1106,6 +1104,8 @@ class RoomWebhooksPlugin(Plugin):
         flag = v in ("on", "true", "1")
         rid = await self._resolve_target_room(evt, target)
         if not rid:
+            return
+        if not await self._check_admin_here(evt, rid):
             return
         rid_s = str(rid)
 
@@ -1456,13 +1456,20 @@ class RoomWebhooksPlugin(Plugin):
             return parts[:-1], last
         return parts, None
 
-    async def _check_admin_here(self, evt: MessageEvent) -> bool:
+    async def _check_admin_here(self, evt: MessageEvent, room_id: Optional[RoomID] = None) -> bool:
+        rid = room_id or evt.room_id
         if evt.sender in set(self.config["adminlist"] or []):
             return True
         if self.config["restrict_admin_to_local"] and not self._is_local(evt.sender):
             await evt.reply("Only local users are allowed to do this.")
             return False
-        if not await self._has_required_pl(evt.room_id, evt.sender):
-            await evt.reply(f"You need power level ≥ {self.config['pl_required']} in this room.")
+        if not await self._has_required_pl(rid, evt.sender):
+            where = "this room" if rid == evt.room_id else f"target room `{rid}`"
+            await evt.reply(f"You need power level ≥ {self.config['pl_required']} in {where}.")
             return False
+        if rid != evt.room_id:
+            bot_mem = await self._get_membership(rid, self.client.mxid)
+            if bot_mem != "join":
+                await evt.reply(f"Bot is not joined to target room `{rid}`.")
+                return False
         return True
