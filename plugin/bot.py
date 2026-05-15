@@ -29,6 +29,21 @@ def clamp_body(req: Request, max_bytes: int) -> None:
     if max_bytes and req.content_length and req.content_length > max_bytes:
         raise ValueError("payload_too_large")
 
+async def read_body_limited(req: Request, max_bytes: int) -> bytes:
+    """Read the request body, enforcing max_bytes even when Content-Length
+    is missing or lies. Streams chunks and aborts as soon as the running
+    total exceeds the cap."""
+    if max_bytes <= 0:
+        return await req.read()
+    chunks: List[bytes] = []
+    total = 0
+    async for chunk in req.content.iter_chunked(8192):
+        total += len(chunk)
+        if total > max_bytes:
+            raise ValueError("payload_too_large")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
 def parse_auth_token(req: Request, allow_query: bool) -> Optional[str]:
     h = req.headers.get(hdrs.AUTHORIZATION)
     if h and " " in h:
@@ -288,7 +303,9 @@ class RoomWebhooksPlugin(Plugin):
     async def start(self) -> None:
         self.config.load_and_update()
         self.jinja = jinja2.Environment(autoescape=True)
-        self._rate: Dict[str, int] = {}  # simple in-memory rate bucket
+        # rate buckets: key -> (minute, count); overwritten on minute rollover
+        # so the dict is bounded by the number of unique keys, not uptime.
+        self._rate: Dict[str, Tuple[int, int]] = {}
         self.log.info(f"Webhook base URL: {self.webapp_url}")
 
     # ---- rate limiting (in-memory) ----
@@ -297,11 +314,13 @@ class RoomWebhooksPlugin(Plugin):
         if limit <= 0:
             return True
         minute = int(time.time() // 60)
-        bucket = f"{key}:{minute}"
-        count = self._rate.get(bucket, 0)
-        if count >= limit:
+        cur = self._rate.get(key)
+        if cur is None or cur[0] != minute:
+            self._rate[key] = (minute, 1)
+            return True
+        if cur[1] >= limit:
             return False
-        self._rate[bucket] = count + 1
+        self._rate[key] = (minute, cur[1] + 1)
         return True
 
     # ---- admin & local guards ----
@@ -1118,9 +1137,9 @@ class RoomWebhooksPlugin(Plugin):
 
     # ---------------- web handlers ----------------
 
-    async def _parse_body(self, req: Request) -> Dict[str, Any]:
+    async def _parse_body(self, req: Request, max_bytes: int = 0) -> Dict[str, Any]:
         ctype = (req.headers.get("Content-Type") or "").lower()
-        raw = await req.read()
+        raw = await read_body_limited(req, max_bytes)
         text = raw.decode(errors="replace")
 
         # If explicitly JSON, try JSON but fallback safely
@@ -1156,55 +1175,44 @@ class RoomWebhooksPlugin(Plugin):
             }
 
 
-    @web.post("/send")
-    async def handle_send(self, req: Request) -> Response:
+    async def _run_webhook(self, req: Request, token: Optional[str]) -> Response:
         if req.method not in set(self.config["allowed_methods"] or []):
             return Response(status=405, text="method_not_allowed")
+        max_bytes = int(self.config["max_body_bytes"] or 0)
         try:
-            clamp_body(req, int(self.config["max_body_bytes"] or 0))
+            clamp_body(req, max_bytes)
         except ValueError:
             return Response(status=413, text="payload_too_large")
 
-        token = parse_auth_token(req, self.config["allow_query_token"])
         if not token:
             return Response(status=401, text="missing_token")
 
-        if not self._rate_ok(f"tok:{token[:10]}"):
+        if not self._rate_ok(f"tok:{sha256_hex(token)[:16]}"):
             return Response(status=429, text="rate_limited")
 
         try:
-            data = await self._parse_body(req)
+            data = await self._parse_body(req, max_bytes)
         except ValueError as e:
-            return Response(status=400, text=str(e))
+            msg = str(e)
+            status = 413 if msg == "payload_too_large" else 400
+            return Response(status=status, text=msg)
 
         ok, err = await self._deliver_by_token(token, data)
         if not ok:
             return self._err_to_resp(err)
         return Response(status=204)
+
+    @web.post("/send")
+    async def handle_send(self, req: Request) -> Response:
+        token = parse_auth_token(req, self.config["allow_query_token"])
+        return await self._run_webhook(req, token)
 
     @web.post("/hook/{token}")
     async def handle_hook_token(self, req: Request) -> Response:
-        if req.method not in set(self.config["allowed_methods"] or []):
-            return Response(status=405, text="method_not_allowed")
-        try:
-            clamp_body(req, int(self.config["max_body_bytes"] or 0))
-        except ValueError:
-            return Response(status=413, text="payload_too_large")
-
+        if not self.config["enable_path_token_route"]:
+            return Response(status=404, text="not_found")
         token = req.match_info["token"]
-
-        if not self._rate_ok(f"tok:{token[:10]}"):
-            return Response(status=429, text="rate_limited")
-
-        try:
-            data = await self._parse_body(req)
-        except ValueError as e:
-            return Response(status=400, text=str(e))
-
-        ok, err = await self._deliver_by_token(token, data)
-        if not ok:
-            return self._err_to_resp(err)
-        return Response(status=204)
+        return await self._run_webhook(req, token)
 
     def _err_to_resp(self, err: Optional[str]) -> Response:
         if err == "bad_token":
