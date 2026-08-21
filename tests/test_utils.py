@@ -229,6 +229,46 @@ def test_wrap_p_content_injects_into_existing_p_when_requested():
     assert out == "<p>PRE: hi</p>"
 
 
+# ---- rate limiter / flood protection ----
+
+def _bare_plugin() -> RoomWebhooksPlugin:
+    p = RoomWebhooksPlugin.__new__(RoomWebhooksPlugin)
+    p._rate = {}
+    p._rate_minute = None
+    return p
+
+
+def test_rate_ok_disabled_when_limit_zero():
+    p = _bare_plugin()
+    assert all(p._rate_ok("k", 0) for _ in range(1000))
+
+
+def test_rate_ok_blocks_after_limit():
+    p = _bare_plugin()
+    results = [p._rate_ok("hook:room:name", 5) for _ in range(8)]
+    assert results == [True] * 5 + [False] * 3
+
+
+def test_rate_ok_buckets_are_independent():
+    p = _bare_plugin()
+    assert [p._rate_ok("a", 1), p._rate_ok("b", 1)] == [True, True]
+    assert [p._rate_ok("a", 1), p._rate_ok("b", 1)] == [False, False]
+
+
+def test_capped_chunks_truncates_and_notes():
+    p = _bare_plugin()
+    p.config = {"max_chunks_per_message": 3}
+    chunks = p._capped_chunks("x" * 16000 * 6)
+    assert len(chunks) == 3
+    assert "truncated" in chunks[-1]
+
+
+def test_capped_chunks_no_cap_when_zero():
+    p = _bare_plugin()
+    p.config = {"max_chunks_per_message": 0}
+    assert len(p._capped_chunks("x" * 16000 * 6)) == 6
+
+
 def test_wrap_p_content_prefix_with_backslash_is_literal():
     # A displayname containing backslashes/group refs must not be
     # interpreted by re.sub (would raise "bad escape" or expand groups).
