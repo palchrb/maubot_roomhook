@@ -301,7 +301,9 @@ class PluginConfig(BaseProxyConfig):
         h.copy("adminlist")
         # http
         h.copy("rate_limit_per_minute")
+        h.copy("rate_limit_burst")
         h.copy("room_rate_limit_per_minute")
+        h.copy("room_rate_limit_burst")
         h.copy("max_chunks_per_message")
         h.copy("max_body_bytes")
         h.copy("allowed_methods")
@@ -331,11 +333,10 @@ class RoomWebhooksPlugin(Plugin):
         self.jinja = SandboxedEnvironment(autoescape=True)
         # compiled-template cache: sha256(source) -> Template
         self._tpl_cache: Dict[str, jinja2.Template] = {}
-        # rate buckets: key -> (minute, count); stale entries are pruned on
-        # minute rollover and the dict is hard-capped so a flood of unique
-        # keys (e.g. random tokens) cannot grow memory without bound.
-        self._rate: Dict[str, Tuple[int, int]] = {}
-        self._rate_minute: Optional[int] = None
+        # token buckets: key -> (tokens, last_refill_monotonic). Keys are
+        # resolved hooks/rooms only (never attempted tokens), so the dict is
+        # bounded by real hooks; idle entries are pruned when it grows large.
+        self._rate: Dict[str, Tuple[float, float]] = {}
         self.log.info(f"Webhook base URL: {self.webapp_url}")
 
     def _get_template(self, src: str) -> jinja2.Template:
@@ -348,26 +349,38 @@ class RoomWebhooksPlugin(Plugin):
             self._tpl_cache[key] = tpl
         return tpl
 
-    # ---- rate limiting (in-memory) ----
+    # ---- rate limiting (in-memory token bucket) ----
     _RATE_MAX_KEYS = 10_000
 
-    def _rate_ok(self, key: str, limit: int) -> bool:
-        if limit <= 0:
+    def _rate_ok(self, key: str, limit_per_minute: int, burst: Optional[int] = None) -> bool:
+        """Token bucket: refills continuously at `limit_per_minute`/60 per
+        second, holds at most `burst` tokens. Unlike a fixed minute window,
+        this stops a runaway script after `burst` messages instead of
+        letting a whole minute's quota through in one second, while still
+        allowing small legitimate bursts."""
+        if limit_per_minute <= 0:
             return True
-        minute = int(time.time() // 60)
-        if self._rate_minute != minute:
-            self._rate = {k: v for k, v in self._rate.items() if v[0] == minute}
-            self._rate_minute = minute
+        cap = float(burst) if burst and burst > 0 else float(min(limit_per_minute, 10))
+        now = time.monotonic()
         cur = self._rate.get(key)
-        if cur is None or cur[0] != minute:
-            if cur is None and len(self._rate) >= self._RATE_MAX_KEYS:
-                self._rate.clear()
-            self._rate[key] = (minute, 1)
-            return True
-        if cur[1] >= limit:
+        if cur is None:
+            tokens = cap
+            if len(self._rate) >= self._RATE_MAX_KEYS:
+                self._prune_rate(now)
+        else:
+            tokens = min(cap, cur[0] + (now - cur[1]) * limit_per_minute / 60.0)
+        if tokens < 1.0:
+            self._rate[key] = (tokens, now)
             return False
-        self._rate[key] = (minute, cur[1] + 1)
+        self._rate[key] = (tokens - 1.0, now)
         return True
+
+    def _prune_rate(self, now: float) -> None:
+        stale = [k for k, (_, last) in self._rate.items() if now - last > 300]
+        for k in stale:
+            del self._rate[k]
+        if len(self._rate) >= self._RATE_MAX_KEYS:
+            self._rate.clear()
 
     # ---- admin & local guards ----
     def _user_domain(self, user: UserID) -> str:
@@ -1327,9 +1340,11 @@ class RoomWebhooksPlugin(Plugin):
         # never consume buckets or memory.
         hook_limit = int(self.config["rate_limit_per_minute"] or 0)
         room_limit = int(self.config["room_rate_limit_per_minute"] or 0)
-        if not self._rate_ok(f"hook:{row['room_id']}:{row['name']}", hook_limit):
+        hook_burst = int(self.config["rate_limit_burst"] or 0)
+        room_burst = int(self.config["room_rate_limit_burst"] or 0)
+        if not self._rate_ok(f"hook:{row['room_id']}:{row['name']}", hook_limit, hook_burst):
             return False, "rate_limited"
-        if not self._rate_ok(f"room:{row['room_id']}", room_limit):
+        if not self._rate_ok(f"room:{row['room_id']}", room_limit, room_burst):
             return False, "rate_limited"
         return await self._render_and_send(row, data)
 

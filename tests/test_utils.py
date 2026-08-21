@@ -234,7 +234,6 @@ def test_wrap_p_content_injects_into_existing_p_when_requested():
 def _bare_plugin() -> RoomWebhooksPlugin:
     p = RoomWebhooksPlugin.__new__(RoomWebhooksPlugin)
     p._rate = {}
-    p._rate_minute = None
     return p
 
 
@@ -243,16 +242,41 @@ def test_rate_ok_disabled_when_limit_zero():
     assert all(p._rate_ok("k", 0) for _ in range(1000))
 
 
-def test_rate_ok_blocks_after_limit():
+def test_rate_ok_burst_then_blocks():
     p = _bare_plugin()
     results = [p._rate_ok("hook:room:name", 5) for _ in range(8)]
+    # burst defaults to min(limit, 10) = 5 → 5 through, then throttled
     assert results == [True] * 5 + [False] * 3
+
+
+def test_rate_ok_explicit_burst_caps_initial_burst():
+    p = _bare_plugin()
+    results = [p._rate_ok("k", 60, 2) for _ in range(4)]
+    assert results == [True, True, False, False]
 
 
 def test_rate_ok_buckets_are_independent():
     p = _bare_plugin()
     assert [p._rate_ok("a", 1), p._rate_ok("b", 1)] == [True, True]
     assert [p._rate_ok("a", 1), p._rate_ok("b", 1)] == [False, False]
+
+
+def test_rate_ok_refills_over_time(monkeypatch):
+    import plugin.bot as botmod
+    t = [0.0]
+    monkeypatch.setattr(botmod.time, "monotonic", lambda: t[0])
+    p = _bare_plugin()
+    # 60/min = 1 token per second, burst 2
+    assert p._rate_ok("k", 60, 2)
+    assert p._rate_ok("k", 60, 2)
+    assert not p._rate_ok("k", 60, 2)   # bucket empty
+    t[0] = 1.0                          # one second later → one token back
+    assert p._rate_ok("k", 60, 2)
+    assert not p._rate_ok("k", 60, 2)
+    t[0] = 120.0                        # long idle → refills only to burst cap
+    assert p._rate_ok("k", 60, 2)
+    assert p._rate_ok("k", 60, 2)
+    assert not p._rate_ok("k", 60, 2)
 
 
 def test_capped_chunks_truncates_and_notes():

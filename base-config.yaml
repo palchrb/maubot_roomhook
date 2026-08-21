@@ -8,9 +8,14 @@ pl_required: 50
 adminlist: []
 
 # Flood protection — mainly for a script gone haywire, not for auth
-# (tokens are unguessable anyway). All three: 0 = disabled.
-rate_limit_per_minute: 60        # max requests per minute per hook
-room_rate_limit_per_minute: 120  # max requests per minute per room (all hooks combined)
+# (tokens are unguessable anyway). Token-bucket: the per-minute value is
+# the sustained rate (refilled continuously), burst is how many messages
+# may come through back-to-back before throttling kicks in. Limits with
+# 0 = disabled; burst 0 = auto (min(rate, 10)).
+rate_limit_per_minute: 60        # sustained rate per hook
+rate_limit_burst: 10             # max back-to-back messages per hook
+room_rate_limit_per_minute: 120  # sustained rate per room (all hooks combined)
+room_rate_limit_burst: 20        # max back-to-back messages per room
 max_chunks_per_message: 10       # max Matrix events one webhook request may emit (rest is truncated)
 max_body_bytes: 1048576          # reject request bodies larger than this (1 MiB)
 allowed_methods: ["POST"]
