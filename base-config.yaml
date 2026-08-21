@@ -7,8 +7,12 @@ local_homeserver_domain: "example.com"
 pl_required: 50
 adminlist: []
 
-rate_limit_per_minute: 0
-max_body_bytes: 0
+# Flood protection — mainly for a script gone haywire, not for auth
+# (tokens are unguessable anyway). All three: 0 = disabled.
+rate_limit_per_minute: 60        # max requests per minute per hook
+room_rate_limit_per_minute: 120  # max requests per minute per room (all hooks combined)
+max_chunks_per_message: 10       # max Matrix events one webhook request may emit (rest is truncated)
+max_body_bytes: 1048576          # reject request bodies larger than this (1 MiB)
 allowed_methods: ["POST"]
 enable_path_token_route: true
 allow_query_token: true

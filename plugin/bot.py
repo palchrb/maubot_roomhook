@@ -301,6 +301,8 @@ class PluginConfig(BaseProxyConfig):
         h.copy("adminlist")
         # http
         h.copy("rate_limit_per_minute")
+        h.copy("room_rate_limit_per_minute")
+        h.copy("max_chunks_per_message")
         h.copy("max_body_bytes")
         h.copy("allowed_methods")
         h.copy("enable_path_token_route")
@@ -349,8 +351,7 @@ class RoomWebhooksPlugin(Plugin):
     # ---- rate limiting (in-memory) ----
     _RATE_MAX_KEYS = 10_000
 
-    def _rate_ok(self, key: str) -> bool:
-        limit = int(self.config["rate_limit_per_minute"] or 0)
+    def _rate_ok(self, key: str, limit: int) -> bool:
         if limit <= 0:
             return True
         minute = int(time.time() // 60)
@@ -1265,9 +1266,6 @@ class RoomWebhooksPlugin(Plugin):
         if not token:
             return Response(status=401, text="missing_token")
 
-        if not self._rate_ok(f"tok:{sha256_hex(token)[:16]}"):
-            return Response(status=429, text="rate_limited")
-
         try:
             data = await self._parse_body(req, max_bytes)
         except ValueError as e:
@@ -1295,6 +1293,8 @@ class RoomWebhooksPlugin(Plugin):
     def _err_to_resp(self, err: Optional[str]) -> Response:
         if err == "bad_token":
             return Response(status=401, text="bad_token")
+        if err == "rate_limited":
+            return Response(status=429, text="rate_limited")
         if err == "revoked":
             return Response(status=404, text="no_active_hook")
         if err == "template_error":
@@ -1321,6 +1321,16 @@ class RoomWebhooksPlugin(Plugin):
             return False, "bad_token"
         if row["revoked"]:
             return False, "revoked"
+        # Flood protection: limit per hook and per room (all hooks in the
+        # room combined), so a runaway script cannot flood a room. Keyed on
+        # the resolved hook, not the attempted token, so invalid tokens
+        # never consume buckets or memory.
+        hook_limit = int(self.config["rate_limit_per_minute"] or 0)
+        room_limit = int(self.config["room_rate_limit_per_minute"] or 0)
+        if not self._rate_ok(f"hook:{row['room_id']}:{row['name']}", hook_limit):
+            return False, "rate_limited"
+        if not self._rate_ok(f"room:{row['room_id']}", room_limit):
+            return False, "rate_limited"
         return await self._render_and_send(row, data)
 
     def _resolve_profile_for_message(self, row: Dict[str, Any], data: Dict[str, Any]) -> Tuple[str, str, str]:
@@ -1436,6 +1446,18 @@ class RoomWebhooksPlugin(Plugin):
         s = html.unescape(s)
         return s
 
+    def _capped_chunks(self, text: str) -> List[str]:
+        """Split into Matrix-sized chunks, but cap how many events a single
+        webhook request may emit so one oversized payload cannot flood the
+        room on its own."""
+        chunks = split_chunks(text)
+        cap = int(self.config["max_chunks_per_message"] or 0)
+        if cap > 0 and len(chunks) > cap:
+            dropped = len(chunks) - cap
+            chunks = chunks[:cap]
+            chunks[-1] += f"\n… [truncated: {dropped} more chunk(s) dropped]"
+        return chunks
+
     async def _render_and_send(self, row: Dict[str, Any], data: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
         room = RoomID(row["room_id"])
         fmt = (row["fmt"] or self.config["message_format"]).lower()
@@ -1457,7 +1479,7 @@ class RoomWebhooksPlugin(Plugin):
             except Exception as e:
                 self.log.error(f"Template render error for {row['room_id']}/{row['name']}: {e}")
                 return False, "template_error"
-            chunks = split_chunks(rendered)
+            chunks = self._capped_chunks(rendered)
             for chunk in chunks:
                 ok, err = await self._send_profiled_content(room, row, chunk, fmt, msgtype, data, prefix_enabled)
                 if not ok:
@@ -1467,7 +1489,7 @@ class RoomWebhooksPlugin(Plugin):
         if bool(row.get("raw", False)):
             raw_text = json.dumps(data, ensure_ascii=False, indent=2)
             md = f"**Data received**\n```\n{raw_text}\n```"
-            for chunk in split_chunks(md):
+            for chunk in self._capped_chunks(md):
                 ok, err = await self._send_profiled_content(room, row, chunk, "markdown", msgtype, data, prefix_enabled)
                 if not ok:
                     return False, err
@@ -1481,7 +1503,7 @@ class RoomWebhooksPlugin(Plugin):
         if body is None:
             body = data.get("text")
         if body is not None:
-            for chunk in split_chunks(str(body)):
+            for chunk in self._capped_chunks(str(body)):
                 ok, err = await self._send_profiled_content(room, row, chunk, fmt, msgtype, data, prefix_enabled)
                 if not ok:
                     return False, err
@@ -1489,7 +1511,7 @@ class RoomWebhooksPlugin(Plugin):
 
         raw_text = json.dumps(data, ensure_ascii=False, indent=2)
         md = f"**Data received**\n```\n{raw_text}\n```"
-        for chunk in split_chunks(md):
+        for chunk in self._capped_chunks(md):
             ok, err = await self._send_profiled_content(room, row, chunk, "markdown", msgtype, data, prefix_enabled)
             if not ok:
                 return False, err
