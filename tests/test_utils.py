@@ -71,6 +71,25 @@ def test_split_chunks_exact_multiple():
     assert split_chunks(s, 3) == ["abc", "def"]
 
 
+def test_split_chunks_is_byte_based_and_utf8_safe():
+    # "æ" is 2 bytes in UTF-8: a 4-byte limit fits 2 chars per chunk.
+    s = "æ" * 10
+    chunks = split_chunks(s, 4)
+    assert "".join(chunks) == s
+    for c in chunks:
+        assert len(c.encode("utf-8")) <= 4
+        c.encode("utf-8").decode("utf-8")  # never split mid-codepoint
+    assert chunks == ["ææ"] * 5
+
+
+def test_split_chunks_default_limit_stays_below_matrix_event_cap():
+    # 20k 4-byte emoji = 80kB — must be split into <=16000-byte chunks.
+    s = "🎉" * 20000
+    chunks = split_chunks(s)
+    assert "".join(chunks) == s
+    assert all(len(c.encode("utf-8")) <= 16000 for c in chunks)
+
+
 # ---- trim_utf8_bytes ----
 
 def test_trim_utf8_bytes_no_op_within_limit():
@@ -163,6 +182,17 @@ def test_markdown_to_html_handles_none():
     assert markdown_to_html(None) == ""
 
 
+def test_markdown_to_html_url_label_not_double_linked():
+    out = markdown_to_html("[https://example.com](https://example.com)")
+    assert out.count("<a ") == 1
+    assert 'href="https://example.com"' in out
+
+
+def test_markdown_to_html_autolinks_bare_url():
+    out = markdown_to_html("see https://example.com now")
+    assert '<a href="https://example.com"' in out
+
+
 # ---- _escape_html ----
 
 def test_escape_html_lt_gt_amp():
@@ -197,6 +227,15 @@ def test_wrap_block_content_gets_separate_p():
 def test_wrap_p_content_injects_into_existing_p_when_requested():
     out = RoomWebhooksPlugin._wrap_html_with_prefix("<p>hi</p>", "PRE: ", inject_into_p=True)
     assert out == "<p>PRE: hi</p>"
+
+
+def test_wrap_p_content_prefix_with_backslash_is_literal():
+    # A displayname containing backslashes/group refs must not be
+    # interpreted by re.sub (would raise "bad escape" or expand groups).
+    out = RoomWebhooksPlugin._wrap_html_with_prefix(
+        "<p>hi</p>", r"a\1b\q: ", inject_into_p=True
+    )
+    assert out == r"<p>a\1b\q: hi</p>"
 
 
 def test_wrap_p_content_without_inject_treats_as_inline():

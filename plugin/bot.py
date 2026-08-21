@@ -1,4 +1,5 @@
 import time, json, hashlib, secrets, jinja2, re, html
+from jinja2.sandbox import SandboxedEnvironment
 from typing import Optional, Dict, Any, Tuple, List
 from urllib.parse import parse_qs
 from email.utils import parseaddr
@@ -56,14 +57,29 @@ def parse_auth_token(req: Request, allow_query: bool) -> Optional[str]:
             return tok
     return None
 
+HOOK_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
 def escape_md(s: str) -> str:
     return re.sub(r'([\\`*_{}\[\]()#+\-!])', r'\\\1', str(s or ""))
 
-def split_chunks(text: str, limit: int = 60000) -> List[str]:
+def split_chunks(text: str, limit: int = 16000) -> List[str]:
+    """Split text into chunks of at most `limit` UTF-8 bytes. Matrix caps
+    the whole event at 64 KiB including both body and formatted_body, so
+    the per-chunk limit must be well below that and measured in bytes,
+    not characters (a character can be up to 4 bytes)."""
     text = text or ""
-    if len(text) <= limit:
+    if len(text.encode("utf-8")) <= limit:
         return [text]
-    return [text[i:i+limit] for i in range(0, len(text), limit)]
+    chunks: List[str] = []
+    rest = text
+    while rest:
+        head = trim_utf8_bytes(rest, limit)
+        if not head:
+            # limit smaller than one codepoint; emit it anyway to make progress
+            head = rest[0]
+        chunks.append(head)
+        rest = rest[len(head):]
+    return chunks
 
 def trim_utf8_bytes(s: str, limit: int) -> str:
     """Trim string to at most `limit` UTF-8 bytes."""
@@ -152,8 +168,11 @@ def markdown_to_html(md: str) -> str:
         url = m.group(0)
         return f'<a href="{url}" rel="noreferrer noopener">{url}</a>'
 
+    # `>` is excluded so URLs already wrapped in an <a> tag by the markdown
+    # link pass (whose label starts right after `>`) are not linked twice;
+    # literal `>` from the source text was escaped to &gt; in step 1.
     text = re.sub(
-        r"(?<![\"'=])\bhttps?://[^\s<>()]+",
+        r"(?<![\"'=>])\bhttps?://[^\s<>()]+",
         _autolink_repl,
         text,
         flags=re.IGNORECASE,
@@ -261,7 +280,9 @@ def markdown_to_html(md: str) -> str:
         if any(part.lower().startswith(tag) for tag in MD_BLOCK_TAGS):
             out.append(part)
         else:
-            out.append(f"<p>{part.replace('\n', '<br>')}</p>")
+            # No backslash inside the f-string expression → works on Python < 3.12 too.
+            part_br = part.replace("\n", "<br>")
+            out.append(f"<p>{part_br}</p>")
 
     return "".join(out)
 
@@ -302,20 +323,44 @@ class RoomWebhooksPlugin(Plugin):
 
     async def start(self) -> None:
         self.config.load_and_update()
-        self.jinja = jinja2.Environment(autoescape=True)
-        # rate buckets: key -> (minute, count); overwritten on minute rollover
-        # so the dict is bounded by the number of unique keys, not uptime.
+        # Sandboxed: templates are authored by room admins, who are not
+        # necessarily trusted with code execution on the maubot host. The
+        # sandbox blocks access to Python internals (__class__, __mro__, …).
+        self.jinja = SandboxedEnvironment(autoescape=True)
+        # compiled-template cache: sha256(source) -> Template
+        self._tpl_cache: Dict[str, jinja2.Template] = {}
+        # rate buckets: key -> (minute, count); stale entries are pruned on
+        # minute rollover and the dict is hard-capped so a flood of unique
+        # keys (e.g. random tokens) cannot grow memory without bound.
         self._rate: Dict[str, Tuple[int, int]] = {}
+        self._rate_minute: Optional[int] = None
         self.log.info(f"Webhook base URL: {self.webapp_url}")
 
+    def _get_template(self, src: str) -> jinja2.Template:
+        key = sha256_hex(src)
+        tpl = self._tpl_cache.get(key)
+        if tpl is None:
+            if len(self._tpl_cache) >= 128:
+                self._tpl_cache.clear()
+            tpl = self.jinja.from_string(src)
+            self._tpl_cache[key] = tpl
+        return tpl
+
     # ---- rate limiting (in-memory) ----
+    _RATE_MAX_KEYS = 10_000
+
     def _rate_ok(self, key: str) -> bool:
         limit = int(self.config["rate_limit_per_minute"] or 0)
         if limit <= 0:
             return True
         minute = int(time.time() // 60)
+        if self._rate_minute != minute:
+            self._rate = {k: v for k, v in self._rate.items() if v[0] == minute}
+            self._rate_minute = minute
         cur = self._rate.get(key)
         if cur is None or cur[0] != minute:
+            if cur is None and len(self._rate) >= self._RATE_MAX_KEYS:
+                self._rate.clear()
             self._rate[key] = (minute, 1)
             return True
         if cur[1] >= limit:
@@ -499,10 +544,20 @@ class RoomWebhooksPlugin(Plugin):
             return
         old_room = str(evt.room_id)
         await self.client.send_notice(evt.room_id, f"Room was upgraded → moving webhooks to {new_room} …")
-        await self.database.execute(
-            "UPDATE room_hooks SET room_id=$1 WHERE room_id=$2",
-            new_room, old_room
-        )
+        try:
+            await self.database.execute(
+                "UPDATE room_hooks SET room_id=$1 WHERE room_id=$2",
+                new_room, old_room
+            )
+        except Exception:
+            # e.g. a hook with the same name already exists in the new room
+            # → moving would violate the (room_id, name) primary key.
+            self.log.exception(f"Failed to move hooks from {old_room} to {new_room}")
+            await self.client.send_notice(
+                evt.room_id,
+                f"Failed to move webhooks to {new_room} — name conflict or DB error; hooks remain bound to the old room ID.",
+            )
+            return
         await self.client.send_notice(
             evt.room_id,
             f"Done. Path endpoint changes to …/hook/{new_room}… (Bearer /send endpoint is unaffected)."
@@ -614,6 +669,8 @@ class RoomWebhooksPlugin(Plugin):
         rid = await self._resolve_target_room(evt, target)
         if not rid:
             return
+        if not await self._check_read_access(evt, rid):
+            return
         rows = await self.database.fetch(
             "SELECT name, revoked FROM room_hooks WHERE room_id=$1 ORDER BY name", str(rid)
         )
@@ -636,6 +693,9 @@ class RoomWebhooksPlugin(Plugin):
             await self._reply(evt, "Usage: `!webhook add <name> [!room|#alias]`")
             return
         name = parts2[0]
+        if not HOOK_NAME_RE.match(name):
+            await self._reply(evt, "Invalid name: use 1–64 characters from `a-z A-Z 0-9 . _ -`.")
+            return
         rid = await self._resolve_target_room(evt, target)
         if not rid:
             return
@@ -688,18 +748,18 @@ class RoomWebhooksPlugin(Plugin):
         ev_id = await self._notice(evt.room_id, text, markdown=True)
 
         await self.database.execute("""
-            UPDATE room_hooks SET last_token_event_id=$1 WHERE room_id=$2 AND name=$3
-        """, str(ev_id), rid_s, name)
+            UPDATE room_hooks SET last_token_event_id=$1, last_token_room_id=$2 WHERE room_id=$3 AND name=$4
+        """, str(ev_id), str(evt.room_id), rid_s, name)
 
     # ---- save ----
     @webhook.subcommand(name="save", help="Redact the token message")
     @command.argument("args", required=True, pass_raw=True)
     async def webhook_save(self, evt: MessageEvent, args: str) -> None:
         parts = args.split()
-        if not parts:
+        parts2, target = self._maybe_peel_target(parts)
+        if not parts2:
             await self._reply(evt, "Usage: `!webhook save <name> [!room|#alias]`")
             return
-        parts2, target = self._maybe_peel_target(parts)
         name = parts2[0]
         rid = await self._resolve_target_room(evt, target)
         if not rid:
@@ -709,17 +769,20 @@ class RoomWebhooksPlugin(Plugin):
 
         rid_s = str(rid)
         row = await self.database.fetchrow("""
-            SELECT last_token_event_id FROM room_hooks WHERE room_id=$1 AND name=$2
+            SELECT last_token_event_id, last_token_room_id FROM room_hooks WHERE room_id=$1 AND name=$2
         """, rid_s, name)
         if not row or not row["last_token_event_id"]:
             await self._reply(evt, "No token message found to redact.")
             return
         ev_id = row["last_token_event_id"]
+        # The token message is posted in the room the command was run in
+        # (the mgmt room), which is not necessarily the target room.
+        redact_room = RoomID(row["last_token_room_id"]) if row["last_token_room_id"] else evt.room_id
         await self.database.execute("""
-            UPDATE room_hooks SET last_token_event_id=NULL WHERE room_id=$1 AND name=$2
+            UPDATE room_hooks SET last_token_event_id=NULL, last_token_room_id=NULL WHERE room_id=$1 AND name=$2
         """, rid_s, name)
         try:
-            await self.client.redact(rid, ev_id, reason="Hide token")
+            await self.client.redact(redact_room, ev_id, reason="Hide token")
             await self._reply(evt, "✅ Stored. The token message has been redacted.")
         except Exception as e:
             self.log.exception("Redact failed")
@@ -730,10 +793,10 @@ class RoomWebhooksPlugin(Plugin):
     @command.argument("args", required=True, pass_raw=True)
     async def webhook_rotate(self, evt: MessageEvent, args: str) -> None:
         parts = args.split()
-        if not parts:
+        parts2, target = self._maybe_peel_target(parts)
+        if not parts2:
             await self._reply(evt, "Usage: `!webhook rotate <name> [!room|#alias]`")
             return
-        parts2, target = self._maybe_peel_target(parts)
         name = parts2[0]
         rid = await self._resolve_target_room(evt, target)
         if not rid:
@@ -768,18 +831,18 @@ class RoomWebhooksPlugin(Plugin):
             markdown=True,
         )
         await self.database.execute("""
-            UPDATE room_hooks SET last_token_event_id=$1 WHERE room_id=$2 AND name=$3
-        """, str(ev_id), rid_s, name)
+            UPDATE room_hooks SET last_token_event_id=$1, last_token_room_id=$2 WHERE room_id=$3 AND name=$4
+        """, str(ev_id), str(evt.room_id), rid_s, name)
 
     # ---- revoke ----
     @webhook.subcommand(name="revoke", help="Disable a hook")
     @command.argument("args", required=True, pass_raw=True)
     async def webhook_revoke(self, evt: MessageEvent, args: str) -> None:
         parts = args.split()
-        if not parts:
+        parts2, target = self._maybe_peel_target(parts)
+        if not parts2:
             await self._reply(evt, "Usage: `!webhook revoke <name> [!room|#alias]`")
             return
-        parts2, target = self._maybe_peel_target(parts)
         name = parts2[0]
         rid = await self._resolve_target_room(evt, target)
         if not rid:
@@ -809,13 +872,15 @@ class RoomWebhooksPlugin(Plugin):
         if not await self._require_local_cmd(evt):
             return
         parts = args.split()
-        if not parts:
+        parts2, target = self._maybe_peel_target(parts)
+        if not parts2:
             await self._reply(evt, "Usage: `!webhook show <name> [!room|#alias]`")
             return
-        parts2, target = self._maybe_peel_target(parts)
         name = parts2[0]
         rid = await self._resolve_target_room(evt, target)
         if not rid:
+            return
+        if not await self._check_read_access(evt, rid):
             return
 
         rid_s = str(rid)
@@ -840,10 +905,10 @@ class RoomWebhooksPlugin(Plugin):
     @command.argument("args", required=True, pass_raw=True)
     async def webhook_delete(self, evt: MessageEvent, args: str) -> None:
         parts = args.split()
-        if not parts:
+        parts2, target = self._maybe_peel_target(parts)
+        if not parts2:
             await self._reply(evt, "Usage: `!webhook delete <name> [!room|#alias]`")
             return
-        parts2, target = self._maybe_peel_target(parts)
         name = parts2[0]
         rid = await self._resolve_target_room(evt, target)
         if not rid:
@@ -1011,6 +1076,8 @@ class RoomWebhooksPlugin(Plugin):
         rid = await self._resolve_target_room(evt, target)
         if not rid:
             return
+        if not await self._check_read_access(evt, rid):
+            return
         rid_s = str(rid)
 
         row = await self.database.fetchrow("""
@@ -1146,10 +1213,17 @@ class RoomWebhooksPlugin(Plugin):
         raw = await read_body_limited(req, max_bytes)
         text = raw.decode(errors="replace")
 
+        def _as_dict(parsed: Any) -> Dict[str, Any]:
+            # A JSON body can legally be a list/string/number; the rest of
+            # the pipeline expects a dict, so wrap non-dict payloads.
+            if isinstance(parsed, dict):
+                return parsed
+            return {"message": text, "_raw": text, "_json": parsed}
+
         # If explicitly JSON, try JSON but fallback safely
         if "application/json" in ctype:
             try:
-                return json.loads(text or "{}")
+                return _as_dict(json.loads(text or "{}"))
             except Exception:
                 return {
                     "message": text,
@@ -1170,7 +1244,7 @@ class RoomWebhooksPlugin(Plugin):
 
         # Unknown content-type → try JSON, fallback to raw
         try:
-            return json.loads(text or "{}")
+            return _as_dict(json.loads(text or "{}"))
         except Exception:
             return {
                 "message": text,
@@ -1313,7 +1387,10 @@ class RoomWebhooksPlugin(Plugin):
         `<p>prefix</p>inner`; for inline content emit `<p>prefix inner</p>`."""
         inner_stripped = inner.lstrip().lower()
         if inject_into_p and inner_stripped.startswith("<p"):
-            return re.sub(r"(?i)^(\s*<p\s*>)", r"\1" + prefix, inner, count=1)
+            # Use a callable replacement: `prefix` contains user-controlled
+            # text (displayname) where backslashes/group refs would otherwise
+            # be interpreted by re.sub and could raise or corrupt output.
+            return re.sub(r"(?i)^(\s*<p\s*>)", lambda m: m.group(1) + prefix, inner, count=1)
         if any(inner_stripped.startswith(tag) for tag in MD_BLOCK_TAGS):
             return f"<p>{prefix}</p>{inner}"
         return f"<p>{prefix}{inner}</p>"
@@ -1375,7 +1452,7 @@ class RoomWebhooksPlugin(Plugin):
         tpl_src = row["msg_tpl"]
         if tpl_src:
             try:
-                tpl = self.jinja.from_string(tpl_src)
+                tpl = self._get_template(tpl_src)
                 rendered = tpl.render({"json": data, "data": data, "escape_md": escape_md})
             except Exception as e:
                 self.log.error(f"Template render error for {row['room_id']}/{row['name']}: {e}")
@@ -1400,7 +1477,9 @@ class RoomWebhooksPlugin(Plugin):
             ok, err = await self._send_profiled_content(room, row, str(data["html"]), "html", msgtype, data, prefix_enabled)
             return (ok, err)
 
-        body = data.get("message") or data.get("text")
+        body = data.get("message")
+        if body is None:
+            body = data.get("text")
         if body is not None:
             for chunk in split_chunks(str(body)):
                 ok, err = await self._send_profiled_content(room, row, chunk, fmt, msgtype, data, prefix_enabled)
@@ -1478,6 +1557,20 @@ class RoomWebhooksPlugin(Plugin):
         if last.startswith("!") or last.startswith("#"):
             return parts[:-1], last
         return parts, None
+
+    async def _check_read_access(self, evt: MessageEvent, room_id: RoomID) -> bool:
+        """Read-only commands (list/show/profile show) targeting another
+        room require the caller to actually be a member of that room, so
+        arbitrary users cannot enumerate hooks in rooms they are not in."""
+        if room_id == evt.room_id:
+            return True
+        if evt.sender in set(self.config["adminlist"] or []):
+            return True
+        mem = await self._get_membership(room_id, evt.sender)
+        if mem != "join":
+            await self._reply(evt, f"You must be a member of `{room_id}` to view its hooks.")
+            return False
+        return True
 
     async def _check_admin_here(self, evt: MessageEvent, room_id: Optional[RoomID] = None) -> bool:
         rid = room_id or evt.room_id
