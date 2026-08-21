@@ -45,7 +45,9 @@ jobs:
   build-and-release:
     name: Build .mbp and release
     needs: test
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Runs on pushes to main, and on manual "Run workflow" dispatches from
+    # the main branch (dispatches from other branches only run the tests).
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     permissions:
       contents: write
