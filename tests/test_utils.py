@@ -12,9 +12,42 @@ from plugin.bot import (
     trim_utf8_bytes,
     parse_email_from,
     markdown_to_html,
+    extract_message,
     _escape_html,
     RoomWebhooksPlugin,
 )
+
+
+# ---- extract_message ----
+
+def test_extract_message_priority_order():
+    assert extract_message({"message": "a", "text": "b", "msg": "c"}) == ("a", None)
+    assert extract_message({"text": "b", "msg": "c"}) == ("b", None)
+    assert extract_message({"msg": "c"}) == ("c", None)
+    assert extract_message({"content": "d"}) == ("d", None)
+    assert extract_message({"body": "e"}) == ("e", None)
+
+
+def test_extract_message_uptime_kuma_payload():
+    data = {"heartbeat": None, "monitor": None, "msg": "Maubot Testing"}
+    assert extract_message(data) == ("Maubot Testing", None)
+
+
+def test_extract_message_with_title():
+    assert extract_message({"title": "Alert", "message": "Disk full"}) == ("Disk full", "Alert")
+
+
+def test_extract_message_title_only_becomes_body():
+    assert extract_message({"title": "Disk full"}) == ("Disk full", None)
+
+
+def test_extract_message_blank_or_nonstring_title_ignored():
+    assert extract_message({"title": "   ", "message": "hi"}) == ("hi", None)
+    assert extract_message({"title": {"x": 1}, "message": "hi"}) == ("hi", None)
+
+
+def test_extract_message_nothing_found():
+    assert extract_message({"foo": "bar"}) == (None, None)
 
 
 # ---- sha256_hex ----
