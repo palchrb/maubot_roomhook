@@ -59,6 +59,28 @@ def parse_auth_token(req: Request, allow_query: bool) -> Optional[str]:
 
 HOOK_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
+# Message-field names commonly used by webhook senders, in priority order:
+# "message" (generic), "text" (Slack-compatible), "msg" (Uptime Kuma),
+# "content" (Discord-compatible), "body" (Apprise, email gateways).
+MESSAGE_KEYS = ("message", "text", "msg", "content", "body")
+
+def extract_message(data: Dict[str, Any]) -> Tuple[Optional[Any], Optional[str]]:
+    """Find the human-readable message in a webhook payload.
+
+    Returns (body, title). A payload with only a title (Grafana, Gotify,
+    ntfy, Home Assistant style) uses the title as the body."""
+    body = None
+    for key in MESSAGE_KEYS:
+        v = data.get(key)
+        if v is not None:
+            body = v
+            break
+    title = data.get("title")
+    title = title.strip() if isinstance(title, str) and title.strip() else None
+    if body is None and title is not None:
+        return title, None
+    return body, title
+
 def escape_md(s: str) -> str:
     return re.sub(r'([\\`*_{}\[\]()#+\-!])', r'\\\1', str(s or ""))
 
@@ -667,6 +689,7 @@ class RoomWebhooksPlugin(Plugin):
             "- `!webhook profile prefix <name> <on|off> [!room|#alias]` — Toggle inline fallback prefix\n\n"
             "**HTTP**\n"
             "- `POST /send` with `Authorization: Bearer <token>` and JSON `{ \"message\": \"hi\" }`\n"
+            "- Recognized message fields: `message`, `text`, `msg`, `content`, `body` (+ optional `title`); anything else is posted as raw JSON\n"
             "- Or: `POST /hook/<token>` (path token)\n"
             "- Optional per-request profile override: `\"_profile\": {\"id\":\"…\",\"displayname\":\"…\",\"avatar_url\":\"mxc://…\"}`\n"
         )
@@ -1514,15 +1537,14 @@ class RoomWebhooksPlugin(Plugin):
             ok, err = await self._send_profiled_content(room, row, str(data["html"]), "html", msgtype, data, prefix_enabled)
             return (ok, err)
 
-        # Common message-field names: "message" (generic), "text"
-        # (Slack-compatible), "msg" (Uptime Kuma and friends).
-        body = data.get("message")
-        if body is None:
-            body = data.get("text")
-        if body is None:
-            body = data.get("msg")
+        body, title = extract_message(data)
         if body is not None:
-            for chunk in self._capped_chunks(str(body)):
+            text_out = str(body)
+            if title and fmt == "markdown":
+                text_out = f"**{title}**\n{text_out}"
+            elif title and fmt == "plaintext":
+                text_out = f"{title}\n{text_out}"
+            for chunk in self._capped_chunks(text_out):
                 ok, err = await self._send_profiled_content(room, row, chunk, fmt, msgtype, data, prefix_enabled)
                 if not ok:
                     return False, err
