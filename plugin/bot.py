@@ -1514,9 +1514,13 @@ class RoomWebhooksPlugin(Plugin):
             ok, err = await self._send_profiled_content(room, row, str(data["html"]), "html", msgtype, data, prefix_enabled)
             return (ok, err)
 
+        # Common message-field names: "message" (generic), "text"
+        # (Slack-compatible), "msg" (Uptime Kuma and friends).
         body = data.get("message")
         if body is None:
             body = data.get("text")
+        if body is None:
+            body = data.get("msg")
         if body is not None:
             for chunk in self._capped_chunks(str(body)):
                 ok, err = await self._send_profiled_content(room, row, chunk, fmt, msgtype, data, prefix_enabled)
