@@ -1,7 +1,7 @@
 import time, json, hashlib, secrets, jinja2, re, html
 from jinja2.sandbox import SandboxedEnvironment
 from typing import Optional, Dict, Any, Tuple, List
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, quote
 from email.utils import parseaddr
 
 from aiohttp.web import Request, Response
@@ -15,6 +15,7 @@ from mautrix.types import (
     MemberStateEventContent, Membership
 )
 from mautrix.util.config import BaseProxyConfig, ConfigUpdateHelper
+from mautrix.errors import MNotFound
 
 from .migrations import upgrade_table
 
@@ -58,6 +59,17 @@ def parse_auth_token(req: Request, allow_query: bool) -> Optional[str]:
     return None
 
 HOOK_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+# Room version 12+ creators outrank every power level.
+PL_ROOM_CREATOR = 1_000_000
+
+def room_version_int(rv: Any) -> int:
+    """Numeric room version, or 0 for missing/non-numeric (custom) versions
+    so they are treated as pre-v12."""
+    try:
+        return int(str(rv))
+    except (TypeError, ValueError):
+        return 0
 
 # Message-field names commonly used by webhook senders, in priority order:
 # "message" (generic), "text" (Slack-compatible), "msg" (Uptime Kuma),
@@ -359,6 +371,8 @@ class RoomWebhooksPlugin(Plugin):
         # resolved hooks/rooms only (never attempted tokens), so the dict is
         # bounded by real hooks; idle entries are pruned when it grows large.
         self._rate: Dict[str, Tuple[float, float]] = {}
+        # room_id -> creator info from the immutable m.room.create event
+        self._create_cache: Dict[str, Dict[str, Any]] = {}
         self.log.info(f"Webhook base URL: {self.webapp_url}")
 
     def _get_template(self, src: str) -> jinja2.Template:
@@ -420,12 +434,20 @@ class RoomWebhooksPlugin(Plugin):
         return have == want
 
     async def _get_user_pl(self, room_id: RoomID, user: UserID) -> int:
-        owner_pl = await self._owner_pl_if_v12(room_id, user)
-        if owner_pl is not None:
-            return owner_pl
+        info = await self._get_create_info(room_id)
+        if info and str(user) in info["creators"]:
+            return PL_ROOM_CREATOR
 
         try:
             ev = await self.client.get_state_event(room_id, EventType.ROOM_POWER_LEVELS)
+        except MNotFound:
+            # Only a room with no power levels event at all gives its
+            # creator the implicit 100. Once the event exists (in practice
+            # always), the creator's level is whatever it says, so a demoted
+            # creator must not keep admin rights.
+            if info and info["legacy_creator"] == str(user):
+                return 100
+            return 0
         except Exception as e:
             self.log.warning(f"PL fetch failed in {room_id} for {user}: {e}")
             return 0
@@ -473,64 +495,83 @@ class RoomWebhooksPlugin(Plugin):
             return False
         return True
 
-    async def _owner_pl_if_v12(self, room_id: RoomID, user: UserID) -> Optional[int]:
-        ev = None
+    _CREATE_CACHE_MAX = 2000
+
+    async def _get_create_info(self, room_id: RoomID) -> Optional[Dict[str, Any]]:
+        """Who created the room, as far as power is concerned.
+
+        Returns {"creators": frozenset of user IDs with unlimited power
+        (room version 12+: the create event's sender plus
+        additional_creators), "legacy_creator": the `creator` field of
+        room versions 1-10 or None}. Returns None when it cannot be
+        determined, in which case callers fall back to plain power levels.
+
+        m.room.create never changes, so a resolved result is cached for the
+        lifetime of the plugin instance.
+        """
+        key = str(room_id)
+        cached = self._create_cache.get(key)
+        if cached is not None:
+            return cached
+
         try:
             ev = await self.client.get_state_event(room_id, EventType.ROOM_CREATE)
-        except Exception:
-            pass
+        except Exception as e:
+            self.log.debug(f"create event fetch failed in {room_id}: {e}")
+            return None
 
         content: Dict[str, Any] = {}
-        sender = ""
-
         if isinstance(ev, dict):
-            sender = str(ev.get("sender", "") or "")
-            c = ev.get("content")
-            if isinstance(c, dict):
-                content = c
+            content = ev
         elif ev is not None:
             try:
-                if hasattr(ev, "serialize"):
-                    content = ev.serialize()  # type: ignore[attr-defined]
-                else:
-                    content = getattr(ev, "__dict__", {}) or {}
+                content = ev.serialize()
             except Exception:
                 content = getattr(ev, "__dict__", {}) or {}
 
-        rv = (content or {}).get("room_version")
-        try:
-            rv_int = int(str(rv))
-        except Exception:
-            rv_int = None
+        info: Dict[str, Any] = {"creators": frozenset(), "legacy_creator": None}
+        if room_version_int(content.get("room_version")) >= 12:
+            sender = await self._fetch_create_sender(room_id)
+            if not sender:
+                # Not cached, so it is retried next time.
+                return None
+            addl = content.get("additional_creators")
+            extra = [u for u in addl if isinstance(u, str)] if isinstance(addl, list) else []
+            info["creators"] = frozenset([sender, *extra])
+        else:
+            creator = content.get("creator")
+            info["legacy_creator"] = creator if isinstance(creator, str) and creator else None
 
-        if rv_int is not None and rv_int >= 12 and not sender:
+        if len(self._create_cache) >= self._CREATE_CACHE_MAX:
+            self._create_cache.clear()
+        self._create_cache[key] = info
+        return info
+
+    async def _fetch_create_sender(self, room_id: RoomID) -> str:
+        """Sender of m.room.create. The state API only returns the event
+        content, so this needs the full event."""
+        rid = str(room_id)
+        # From room version 12 the room ID is the create event's ID with a
+        # different sigil, so the event can be fetched directly instead of
+        # downloading the whole room state.
+        if ":" not in rid:
             try:
-                from urllib.parse import quote
-                path = f"/_matrix/client/v3/rooms/{quote(str(room_id))}/state"
-                raw_state = await self.client.api.request("GET", path)
-                if isinstance(raw_state, list):
-                    for e in raw_state:
-                        if not isinstance(e, dict):
-                            continue
-                        if e.get("type") == "m.room.create" and (e.get("state_key", "") == ""):
-                            sender = str(e.get("sender", "") or "")
-                            c = e.get("content")
-                            if not content and isinstance(c, dict):
-                                content = c
-                            break
+                path = f"/_matrix/client/v3/rooms/{quote(rid, safe='')}/event/{quote('$' + rid[1:], safe='')}"
+                e = await self.client.api.request("GET", path)
+                if isinstance(e, dict) and e.get("type") == "m.room.create" and e.get("sender"):
+                    return str(e["sender"])
             except Exception as ex:
-                self.log.debug(f"v12 owner sender fetch via /state failed in {room_id}: {ex}")
-
-        if rv_int is not None and rv_int >= 12:
-            addl = (content or {}).get("additional_creators") or []
-            if sender and (sender == str(user) or (isinstance(addl, list) and str(user) in addl)):
-                return 1_000_000
-            return None
-
-        creator = (content or {}).get("creator")
-        if creator and creator == str(user):
-            return 100
-        return None
+                self.log.debug(f"create event fetch by ID failed in {room_id}: {ex}")
+        try:
+            path = f"/_matrix/client/v3/rooms/{quote(rid, safe='')}/state"
+            raw_state = await self.client.api.request("GET", path)
+            if isinstance(raw_state, list):
+                for e in raw_state:
+                    if isinstance(e, dict) and e.get("type") == "m.room.create" and e.get("state_key", "") == "":
+                        return str(e.get("sender", "") or "")
+        except Exception as ex:
+            self.log.debug(f"create sender fetch via /state failed in {room_id}: {ex}")
+        return ""
 
     # --------- MEMBERSHIP (single source of truth) ---------
 
@@ -648,7 +689,10 @@ class RoomWebhooksPlugin(Plugin):
         pl_target = await self._get_user_pl(rid, evt.sender)
 
         read_ok = bot_in_target and you_in_target
-        mutate_ok = bot_in_target and (in_adminlist or (local_ok and pl_target >= required))
+        local_gate = local_ok or not self.config["restrict_admin_to_local"]
+        mutate_ok = bot_in_target and (
+            in_adminlist or (local_gate and you_in_target and pl_target >= required)
+        )
 
         await self._notice(
             evt.room_id,
@@ -680,6 +724,7 @@ class RoomWebhooksPlugin(Plugin):
             "- `!webhook revoke <name> [!room|#alias]` — Disable the hook\n"
             "- `!webhook show <name> [!room|#alias]` — Show endpoints without token\n"
             "- `!webhook delete <name> [!room|#alias]` — Delete a hook\n"
+            "- `!webhook move <name> [!from|#alias] <!to|#alias>` — Move a hook to another room (token unchanged)\n"
             "- `!webhook set <name> <fmt|type|raw> <value> [!room|#alias]` — Per-hook fmt/type/raw\n"
             "- `!webhook tpl <name> reset|message <code> [!room|#alias]` — Manage Jinja template\n"
             "- `!webhook profile show <name> [!room|#alias]` — Show per-hook profile\n"
@@ -967,6 +1012,80 @@ class RoomWebhooksPlugin(Plugin):
             rid_s, name
         )
         await self._reply(evt, f"🗑️ Deleted hook **{name}**.")
+
+    # ---- move ----
+    _MOVE_USAGE = "Usage: `!webhook move <name> [!from|#alias] <!to|#alias>`"
+
+    @webhook.subcommand(name="move", help="Move a hook to another room: !webhook move <name> [!from|#alias] <!to|#alias>")
+    @command.argument("args", required=True, pass_raw=True)
+    async def webhook_move(self, evt: MessageEvent, args: str) -> None:
+        await self._move_hook(evt, args)
+
+    async def _move_hook(self, evt: MessageEvent, args: str) -> None:
+        # The last room argument is always the destination. With one room
+        # the hook is taken from the current room; with two, the first is
+        # the source (for use from a mgmt room).
+        parts = args.split()
+        rooms: List[str] = []
+        while parts and len(rooms) < 2 and parts[-1][:1] in ("!", "#"):
+            rooms.insert(0, parts.pop())
+        if len(parts) != 1 or not rooms:
+            await self._reply(evt, self._MOVE_USAGE)
+            return
+        name = parts[0]
+
+        src = await self._resolve_target_room(evt, rooms[0] if len(rooms) == 2 else None)
+        if not src:
+            return
+        dst = await self._resolve_target_room(evt, rooms[-1])
+        if not dst:
+            return
+        if src == dst:
+            await self._reply(evt, "The hook is already in that room.")
+            return
+        # Source: so nobody can take a hook they do not control. Destination:
+        # so nobody can plant an external message channel in a room they do
+        # not control.
+        if not await self._check_admin_here(evt, src):
+            return
+        if not await self._check_admin_here(evt, dst):
+            return
+
+        src_s, dst_s = str(src), str(dst)
+        row = await self.database.fetchrow(
+            "SELECT revoked FROM room_hooks WHERE room_id=$1 AND name=$2", src_s, name
+        )
+        if not row:
+            await self._reply(evt, f"No hook named **{name}** in `{src}`.", markdown=True)
+            return
+        conflict = await self.database.fetchrow(
+            "SELECT 1 FROM room_hooks WHERE room_id=$1 AND name=$2", dst_s, name
+        )
+        if conflict:
+            await self._reply(
+                evt,
+                f"A hook named **{name}** already exists in `{dst}`. Delete it there first.",
+                markdown=True,
+            )
+            return
+        try:
+            await self.database.execute(
+                "UPDATE room_hooks SET room_id=$1 WHERE room_id=$2 AND name=$3",
+                dst_s, src_s, name,
+            )
+        except Exception:
+            self.log.exception(f"Failed to move hook {src_s}/{name} to {dst_s}")
+            await self._reply(evt, "Failed to move the hook (database error).")
+            return
+        state = " It is still disabled." if row["revoked"] else ""
+        await self._reply(
+            evt,
+            f"📦 Moved hook **{name}** from `{src}` to `{dst}`.{state}\n"
+            "Token, URLs, template and profile are unchanged, so anyone holding "
+            f"the token now posts into the new room. Run `!webhook rotate {name} {dst}` "
+            "if that is not intended.",
+            markdown=True,
+        )
 
     # ---- set (fmt/type/raw) ----
     @webhook.subcommand(name="set", help="Set per-hook format/type/raw: !webhook set <name> <fmt|type|raw> <value> [!room|#alias]")
@@ -1637,20 +1756,29 @@ class RoomWebhooksPlugin(Plugin):
 
     async def _check_admin_here(self, evt: MessageEvent, room_id: Optional[RoomID] = None) -> bool:
         rid = room_id or evt.room_id
-        if evt.sender in set(self.config["adminlist"] or []):
-            return True
-        if self.config["restrict_admin_to_local"] and not self._is_local(evt.sender):
+        remote = rid != evt.room_id
+        in_adminlist = evt.sender in set(self.config["adminlist"] or [])
+        if not in_adminlist and self.config["restrict_admin_to_local"] and not self._is_local(evt.sender):
             await self._reply(evt, "Only local users are allowed to do this.")
             return False
-        if not await self._has_required_pl(rid, evt.sender):
-            where = "this room" if rid == evt.room_id else f"target room `{rid}`"
-            await self._reply(evt, f"You need power level ≥ {self.config['pl_required']} in {where}.")
-            return False
-        if rid != evt.room_id:
+        # Applies to adminlist users too: a hook bound to a room the bot is
+        # not in can never deliver.
+        if remote:
             bot_mem = await self._get_membership(rid, self.client.mxid)
             if bot_mem != "join":
                 await self._reply(evt, f"Bot is not joined to target room `{rid}`.")
                 return False
+        if in_adminlist:
+            return True
+        # Power levels outlive membership: someone who left the room keeps
+        # their entry in m.room.power_levels, so PL alone is not enough.
+        if remote and await self._get_membership(rid, evt.sender) != "join":
+            await self._reply(evt, f"You must be a member of target room `{rid}` to manage its hooks.")
+            return False
+        if not await self._has_required_pl(rid, evt.sender):
+            where = f"target room `{rid}`" if remote else "this room"
+            await self._reply(evt, f"You need power level ≥ {self.config['pl_required']} in {where}.")
+            return False
         return True
 
     # ---- m.notice helpers for command output ----
