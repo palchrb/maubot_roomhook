@@ -648,7 +648,10 @@ class RoomWebhooksPlugin(Plugin):
         pl_target = await self._get_user_pl(rid, evt.sender)
 
         read_ok = bot_in_target and you_in_target
-        mutate_ok = bot_in_target and (in_adminlist or (local_ok and pl_target >= required))
+        local_gate = local_ok or not self.config["restrict_admin_to_local"]
+        mutate_ok = bot_in_target and (
+            in_adminlist or (local_gate and you_in_target and pl_target >= required)
+        )
 
         await self._notice(
             evt.room_id,
@@ -680,6 +683,7 @@ class RoomWebhooksPlugin(Plugin):
             "- `!webhook revoke <name> [!room|#alias]` — Disable the hook\n"
             "- `!webhook show <name> [!room|#alias]` — Show endpoints without token\n"
             "- `!webhook delete <name> [!room|#alias]` — Delete a hook\n"
+            "- `!webhook move <name> [!from|#alias] <!to|#alias>` — Move a hook to another room (token unchanged)\n"
             "- `!webhook set <name> <fmt|type|raw> <value> [!room|#alias]` — Per-hook fmt/type/raw\n"
             "- `!webhook tpl <name> reset|message <code> [!room|#alias]` — Manage Jinja template\n"
             "- `!webhook profile show <name> [!room|#alias]` — Show per-hook profile\n"
@@ -967,6 +971,80 @@ class RoomWebhooksPlugin(Plugin):
             rid_s, name
         )
         await self._reply(evt, f"🗑️ Deleted hook **{name}**.")
+
+    # ---- move ----
+    _MOVE_USAGE = "Usage: `!webhook move <name> [!from|#alias] <!to|#alias>`"
+
+    @webhook.subcommand(name="move", help="Move a hook to another room: !webhook move <name> [!from|#alias] <!to|#alias>")
+    @command.argument("args", required=True, pass_raw=True)
+    async def webhook_move(self, evt: MessageEvent, args: str) -> None:
+        await self._move_hook(evt, args)
+
+    async def _move_hook(self, evt: MessageEvent, args: str) -> None:
+        # The last room argument is always the destination. With one room
+        # the hook is taken from the current room; with two, the first is
+        # the source (for use from a mgmt room).
+        parts = args.split()
+        rooms: List[str] = []
+        while parts and len(rooms) < 2 and parts[-1][:1] in ("!", "#"):
+            rooms.insert(0, parts.pop())
+        if len(parts) != 1 or not rooms:
+            await self._reply(evt, self._MOVE_USAGE)
+            return
+        name = parts[0]
+
+        src = await self._resolve_target_room(evt, rooms[0] if len(rooms) == 2 else None)
+        if not src:
+            return
+        dst = await self._resolve_target_room(evt, rooms[-1])
+        if not dst:
+            return
+        if src == dst:
+            await self._reply(evt, "The hook is already in that room.")
+            return
+        # Source: so nobody can take a hook they do not control. Destination:
+        # so nobody can plant an external message channel in a room they do
+        # not control.
+        if not await self._check_admin_here(evt, src):
+            return
+        if not await self._check_admin_here(evt, dst):
+            return
+
+        src_s, dst_s = str(src), str(dst)
+        row = await self.database.fetchrow(
+            "SELECT revoked FROM room_hooks WHERE room_id=$1 AND name=$2", src_s, name
+        )
+        if not row:
+            await self._reply(evt, f"No hook named **{name}** in `{src}`.", markdown=True)
+            return
+        conflict = await self.database.fetchrow(
+            "SELECT 1 FROM room_hooks WHERE room_id=$1 AND name=$2", dst_s, name
+        )
+        if conflict:
+            await self._reply(
+                evt,
+                f"A hook named **{name}** already exists in `{dst}`. Delete it there first.",
+                markdown=True,
+            )
+            return
+        try:
+            await self.database.execute(
+                "UPDATE room_hooks SET room_id=$1 WHERE room_id=$2 AND name=$3",
+                dst_s, src_s, name,
+            )
+        except Exception:
+            self.log.exception(f"Failed to move hook {src_s}/{name} to {dst_s}")
+            await self._reply(evt, "Failed to move the hook (database error).")
+            return
+        state = " It is still disabled." if row["revoked"] else ""
+        await self._reply(
+            evt,
+            f"📦 Moved hook **{name}** from `{src}` to `{dst}`.{state}\n"
+            "Token, URLs, template and profile are unchanged, so anyone holding "
+            f"the token now posts into the new room. Run `!webhook rotate {name} {dst}` "
+            "if that is not intended.",
+            markdown=True,
+        )
 
     # ---- set (fmt/type/raw) ----
     @webhook.subcommand(name="set", help="Set per-hook format/type/raw: !webhook set <name> <fmt|type|raw> <value> [!room|#alias]")
@@ -1637,20 +1715,29 @@ class RoomWebhooksPlugin(Plugin):
 
     async def _check_admin_here(self, evt: MessageEvent, room_id: Optional[RoomID] = None) -> bool:
         rid = room_id or evt.room_id
-        if evt.sender in set(self.config["adminlist"] or []):
-            return True
-        if self.config["restrict_admin_to_local"] and not self._is_local(evt.sender):
+        remote = rid != evt.room_id
+        in_adminlist = evt.sender in set(self.config["adminlist"] or [])
+        if not in_adminlist and self.config["restrict_admin_to_local"] and not self._is_local(evt.sender):
             await self._reply(evt, "Only local users are allowed to do this.")
             return False
-        if not await self._has_required_pl(rid, evt.sender):
-            where = "this room" if rid == evt.room_id else f"target room `{rid}`"
-            await self._reply(evt, f"You need power level ≥ {self.config['pl_required']} in {where}.")
-            return False
-        if rid != evt.room_id:
+        # Applies to adminlist users too: a hook bound to a room the bot is
+        # not in can never deliver.
+        if remote:
             bot_mem = await self._get_membership(rid, self.client.mxid)
             if bot_mem != "join":
                 await self._reply(evt, f"Bot is not joined to target room `{rid}`.")
                 return False
+        if in_adminlist:
+            return True
+        # Power levels outlive membership: someone who left the room keeps
+        # their entry in m.room.power_levels, so PL alone is not enough.
+        if remote and await self._get_membership(rid, evt.sender) != "join":
+            await self._reply(evt, f"You must be a member of target room `{rid}` to manage its hooks.")
+            return False
+        if not await self._has_required_pl(rid, evt.sender):
+            where = f"target room `{rid}`" if remote else "this room"
+            await self._reply(evt, f"You need power level ≥ {self.config['pl_required']} in {where}.")
+            return False
         return True
 
     # ---- m.notice helpers for command output ----

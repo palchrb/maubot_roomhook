@@ -32,6 +32,29 @@ Admin/PL is checked against the **target room**, not the mgmt room.
 Use `!webhook perms [!room|#alias]` to verify what the bot will let
 you do.
 
+To change a hook in another room you must
+
+- be a joined member of that room (power levels stay in the room state
+  after someone leaves, so PL alone is not accepted),
+- have power level ≥ `pl_required` there (default 50), and
+- be on `local_homeserver_domain` if `restrict_admin_to_local` is on.
+
+Users on `adminlist` skip these three checks. In all cases the bot
+itself must be joined to the room.
+
+### Moving a hook to another room
+
+```
+!webhook move <name> <!to|#alias>              # from the room you are in
+!webhook move <name> <!from|#alias> <!to|#alias>   # from a mgmt room
+```
+
+The last room is always the destination. You need the rights above in
+**both** rooms. The token, URLs, template and profile are unchanged, so
+the sending service does not need to be reconfigured — and anyone
+holding the token now posts into the new room. Run `!webhook rotate`
+afterwards if that is not what you want.
+
 Works in v12 rooms since Maubot works in v12 rooms..
 
 ### Install
